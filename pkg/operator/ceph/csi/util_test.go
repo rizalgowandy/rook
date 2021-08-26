@@ -17,7 +17,6 @@ limitations under the License.
 package csi
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -25,94 +24,21 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-var (
-	testDSTemplate = []byte(`
-kind: DaemonSet
-apiVersion: apps/v1
-metadata:
-  name: test-label
-  namespace: {{ .Namespace }}
-spec:
-  selector:
-    matchLabels:
-      app: test-label
-  template:
-    metadata:
-      labels:
-        app: test-label
-    spec:
-      serviceAccount: test-sa
-      containers:
-        - name: registrar
-          image: {{ .RegistrarImage }}
-        - name: rbdplugin
-          image: {{ .CSIPluginImage }}
-        - name: cephfsplugin
-          image: {{ .CSIPluginImage }}
-`)
-	testSSTemplate = []byte(`
-kind: StatefulSet
-apiVersion: apps/v1
-metadata:
-  name: test-label
-  namespace: {{ .Namespace }}
-spec:
-  selector:
-    matchLabels:
-      app: test-label
-  template:
-    metadata:
-      labels:
-        app: test-label
-    spec:
-      serviceAccount: test-sa
-      containers:
-        - name: csi-rbdplugin-attacher
-          image: {{ .AttacherImage }}
-        - name: provisioner
-          image: {{ .ProvisionerImage }}
-        - name: rbdplugin
-          image: {{ .CSIPluginImage }}
-        - name: cephfsplugin
-          image: {{ .CSIPluginImage }}
-`)
-)
-
 func TestDaemonSetTemplate(t *testing.T) {
-	tmp, err := ioutil.TempFile("", "yaml")
-	assert.Nil(t, err)
-
-	defer os.Remove(tmp.Name())
-
-	_, err = tmp.Write(testDSTemplate)
-	assert.Nil(t, err)
-	err = tmp.Close()
-	assert.Nil(t, err)
-
 	tp := templateParam{
 		Param:     CSIParam,
 		Namespace: "foo",
 	}
-	_, err = templateToDaemonSet("test-ds", tmp.Name(), tp)
+	_, err := templateToDaemonSet("test-ds", RBDPluginTemplatePath, tp)
 	assert.Nil(t, err)
 }
 
-func TestStatefulSetTemplate(t *testing.T) {
-	tmp, err := ioutil.TempFile("", "yaml")
-	assert.Nil(t, err)
-
-	defer os.Remove(tmp.Name())
-
-	_, err = tmp.Write(testSSTemplate)
-	assert.Nil(t, err)
-	err = tmp.Close()
-	assert.Nil(t, err)
-
+func TestDeploymentTemplate(t *testing.T) {
 	tp := templateParam{
 		Param:     CSIParam,
 		Namespace: "foo",
 	}
-	_, err = templateToStatefulSet("test-ss", tmp.Name(), tp)
+	_, err := templateToDeployment("test-dep", RBDProvisionerDepTemplatePath, tp)
 	assert.Nil(t, err)
 }
 

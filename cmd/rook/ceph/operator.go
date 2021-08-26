@@ -19,12 +19,9 @@ package ceph
 import (
 	"github.com/pkg/errors"
 	"github.com/rook/rook/cmd/rook/rook"
-	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/agent/flexvolume/attachment"
 	operator "github.com/rook/rook/pkg/operator/ceph"
 	cluster "github.com/rook/rook/pkg/operator/ceph/cluster"
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
-	"github.com/rook/rook/pkg/operator/ceph/csi"
 
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
@@ -44,17 +41,6 @@ https://github.com/rook/rook`,
 }
 
 func init() {
-	operatorCmd.Flags().DurationVar(&mon.HealthCheckInterval, "mon-healthcheck-interval", mon.HealthCheckInterval, "mon health check interval (duration)")
-	operatorCmd.Flags().DurationVar(&mon.MonOutTimeout, "mon-out-timeout", mon.MonOutTimeout, "mon out timeout (duration)")
-
-	// csi deployment templates
-	operatorCmd.Flags().StringVar(&csi.RBDPluginTemplatePath, "csi-rbd-plugin-template-path", csi.DefaultRBDPluginTemplatePath, "path to ceph-csi rbd plugin template")
-
-	operatorCmd.Flags().StringVar(&csi.RBDProvisionerDepTemplatePath, "csi-rbd-provisioner-dep-template-path", csi.DefaultRBDProvisionerDepTemplatePath, "path to ceph-csi rbd provisioner deployment template")
-
-	operatorCmd.Flags().StringVar(&csi.CephFSPluginTemplatePath, "csi-cephfs-plugin-template-path", csi.DefaultCephFSPluginTemplatePath, "path to ceph-csi cephfs plugin template")
-	operatorCmd.Flags().StringVar(&csi.CephFSProvisionerDepTemplatePath, "csi-cephfs-provisioner-dep-template-path", csi.DefaultCephFSProvisionerDepTemplatePath, "path to ceph-csi cephfs provisioner deployment template")
-
 	operatorCmd.Flags().BoolVar(&cluster.EnableMachineDisruptionBudget, "enable-machine-disruption-budget", false, "enable fencing controllers")
 
 	flags.SetFlagsFromEnv(operatorCmd.Flags(), rook.RookEnvVarPrefix)
@@ -70,13 +56,13 @@ func startOperator(cmd *cobra.Command, args []string) error {
 
 	logger.Info("starting Rook-Ceph operator")
 	context := createContext()
-	context.NetworkInfo = clusterd.NetworkInfo{}
 	context.ConfigDir = k8sutil.DataDir
 	volumeAttachment, err := attachment.New(context)
 	if err != nil {
 		rook.TerminateFatal(err)
 	}
 
+	rook.CheckOperatorResources(context.Clientset)
 	rookImage := rook.GetOperatorImage(context.Clientset, containerName)
 	rookBaseImageCephVersion, err := rook.GetOperatorBaseImageCephVersion(context)
 	if err != nil {
@@ -89,7 +75,7 @@ func startOperator(cmd *cobra.Command, args []string) error {
 	op := operator.New(context, volumeAttachment, rookImage, serviceAccountName)
 	err = op.Run()
 	if err != nil {
-		rook.TerminateFatal(errors.Wrap(err, "failed to run operator\n"))
+		rook.TerminateFatal(errors.Wrap(err, "failed to run operator"))
 	}
 
 	return nil

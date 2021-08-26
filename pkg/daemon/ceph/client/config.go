@@ -61,13 +61,9 @@ var (
 
 // GlobalConfig represents the [global] sections of Ceph's config file.
 type GlobalConfig struct {
-	FSID           string `ini:"fsid,omitempty"`
-	MonMembers     string `ini:"mon initial members,omitempty"`
-	MonHost        string `ini:"mon host"`
-	PublicAddr     string `ini:"public addr,omitempty"`
-	PublicNetwork  string `ini:"public network,omitempty"`
-	ClusterAddr    string `ini:"cluster addr,omitempty"`
-	ClusterNetwork string `ini:"cluster network,omitempty"`
+	FSID       string `ini:"fsid,omitempty"`
+	MonMembers string `ini:"mon initial members,omitempty"`
+	MonHost    string `ini:"mon host"`
 }
 
 // CephConfig represents an entire Ceph config including all sections.
@@ -162,6 +158,12 @@ func mergeDefaultConfigWithRookConfigOverride(clusterdContext *clusterd.Context,
 		return errors.Wrapf(err, "failed to load config data from %q", k8sutil.ConfigOverrideName)
 	}
 
+	// Remove any debug message setting from the config file
+	// Debug messages will be printed on stdout, rendering the output of each command unreadable, especially json output
+	// This call is idempotent and will not fail if the debug message is not present
+	configFile.Section("global").DeleteKey("debug_ms")
+	configFile.Section("global").DeleteKey("debug ms")
+
 	return nil
 }
 
@@ -192,13 +194,9 @@ func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo
 
 	conf := &CephConfig{
 		GlobalConfig: &GlobalConfig{
-			FSID:           clusterInfo.FSID,
-			MonMembers:     strings.Join(monMembers, " "),
-			MonHost:        strings.Join(monHosts, ","),
-			PublicAddr:     context.NetworkInfo.PublicAddr,
-			PublicNetwork:  context.NetworkInfo.PublicNetwork,
-			ClusterAddr:    context.NetworkInfo.ClusterAddr,
-			ClusterNetwork: context.NetworkInfo.ClusterNetwork,
+			FSID:       clusterInfo.FSID,
+			MonMembers: strings.Join(monMembers, " "),
+			MonHost:    strings.Join(monHosts, ","),
 		},
 	}
 

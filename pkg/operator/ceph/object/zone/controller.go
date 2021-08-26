@@ -26,6 +26,7 @@ import (
 
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -81,14 +82,9 @@ func Add(mgr manager.Manager, context *clusterd.Context) error {
 
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager, context *clusterd.Context) reconcile.Reconciler {
-	// Add the cephv1 scheme to the manager scheme so that the controller knows about it
-	mgrScheme := mgr.GetScheme()
-	if err := cephv1.AddToScheme(mgr.GetScheme()); err != nil {
-		panic(err)
-	}
 	return &ReconcileObjectZone{
 		client:  mgr.GetClient(),
-		scheme:  mgrScheme,
+		scheme:  mgr.GetScheme(),
 		context: context,
 	}
 }
@@ -139,7 +135,7 @@ func (r *ReconcileObjectZone) reconcile(request reconcile.Request) (reconcile.Re
 
 	// The CR was just created, initializing status fields
 	if cephObjectZone.Status == nil {
-		updateStatus(r.client, request.NamespacedName, k8sutil.Created)
+		updateStatus(r.client, request.NamespacedName, k8sutil.EmptyStatus)
 	}
 
 	// Make sure a CephCluster is present otherwise do nothing
@@ -362,7 +358,7 @@ func updateStatus(client client.Client, name types.NamespacedName, status string
 	}
 
 	objectZone.Status.Phase = status
-	if err := opcontroller.UpdateStatus(client, objectZone); err != nil {
+	if err := reporting.UpdateStatus(client, objectZone); err != nil {
 		logger.Errorf("failed to set object zone %q status to %q. %v", name, status, err)
 		return
 	}

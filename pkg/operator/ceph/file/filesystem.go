@@ -230,7 +230,7 @@ func (f *Filesystem) doFilesystemCreate(context *clusterd.Context, clusterInfo *
 	}
 	// This check prevents from concurrent CephFilesystem CRD trying to create a filesystem
 	// Whoever gets to create the Filesystem first wins the race, then we fail if that cluster is not Ceph Pacific and one Filesystem is present
-	if len(fslist) > 0 && !clusterInfo.CephVersion.IsAtLeastPacific() && !cephclient.IsMultiFSEnabled() {
+	if len(fslist) > 0 && !clusterInfo.CephVersion.IsAtLeastPacific() {
 		return errors.New("multiple filesystems are only supported as of ceph pacific")
 	}
 
@@ -247,10 +247,8 @@ func (f *Filesystem) doFilesystemCreate(context *clusterd.Context, clusterInfo *
 		reversedPoolMap[value] = key
 	}
 
-	poolsCreated := false
 	metadataPoolName := generateMetaDataPoolName(f)
 	if _, poolFound := reversedPoolMap[metadataPoolName]; !poolFound {
-		poolsCreated = true
 		err = cephclient.CreatePoolWithProfile(context, clusterInfo, clusterSpec, metadataPoolName, spec.MetadataPool, "")
 		if err != nil {
 			return errors.Wrapf(err, "failed to create metadata pool %q", metadataPoolName)
@@ -261,7 +259,6 @@ func (f *Filesystem) doFilesystemCreate(context *clusterd.Context, clusterInfo *
 	for i, pool := range spec.DataPools {
 		poolName := dataPoolNames[i]
 		if _, poolFound := reversedPoolMap[poolName]; !poolFound {
-			poolsCreated = true
 			err = cephclient.CreatePoolWithProfile(context, clusterInfo, clusterSpec, poolName, pool, "")
 			if err != nil {
 				return errors.Wrapf(err, "failed to create data pool %q", poolName)
@@ -277,7 +274,7 @@ func (f *Filesystem) doFilesystemCreate(context *clusterd.Context, clusterInfo *
 
 	// create the filesystem ('fs new' needs to be forced in order to reuse pre-existing pools)
 	// if only one pool is created new it won't work (to avoid inconsistencies).
-	if err := cephclient.CreateFilesystem(context, clusterInfo, f.Name, metadataPoolName, dataPoolNames, !poolsCreated); err != nil {
+	if err := cephclient.CreateFilesystem(context, clusterInfo, f.Name, metadataPoolName, dataPoolNames); err != nil {
 		return err
 	}
 

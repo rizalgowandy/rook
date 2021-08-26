@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
 scriptdir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-# shellcheck disable=SC1090
+# source=build/common.sh
 source "${scriptdir}/../../build/common.sh"
 
 function wait_for_ssh() {
@@ -22,7 +22,7 @@ function copy_image_to_cluster() {
     local final_image=$2
     local docker_env_tag="${DOCKERCMD}-env"
     ${DOCKERCMD} save "${build_image}" | \
-        (eval "$(minikube ${docker_env_tag} --shell bash)" && \
+        (eval "$(minikube "${docker_env_tag}" --shell bash)" && \
         ${DOCKERCMD} load && \
         ${DOCKERCMD} tag "${build_image}" "${final_image}")
 }
@@ -31,8 +31,6 @@ function copy_images() {
     if [[ "$1" == "" || "$1" == "ceph" ]]; then
       echo "copying ceph images"
       copy_image_to_cluster "${BUILD_REGISTRY}/ceph-amd64" rook/ceph:master
-      # uncomment to push the nautilus image when needed
-      #copy_image_to_cluster ceph/ceph:v15 ceph/ceph:v15
     fi
 
     if [[ "$1" == "" || "$1" == "cassandra" ]]; then

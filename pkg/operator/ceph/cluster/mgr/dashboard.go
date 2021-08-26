@@ -20,6 +20,7 @@ package mgr
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -28,8 +29,10 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/exec"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,15 +112,19 @@ func (c *Cluster) configureDashboardModules() error {
 }
 
 func (c *Cluster) configureDashboardModuleSettings(daemonID string) (bool, error) {
+	monStore := config.GetMonStore(c.context, c.clusterInfo)
+
+	daemonID = fmt.Sprintf("mgr.%s", daemonID)
+
 	// url prefix
-	hasChanged, err := client.MgrSetConfig(c.context, c.clusterInfo, daemonID, "mgr/dashboard/url_prefix", c.spec.Dashboard.URLPrefix, false)
+	hasChanged, err := monStore.SetIfChanged(daemonID, "mgr/dashboard/url_prefix", c.spec.Dashboard.URLPrefix)
 	if err != nil {
 		return false, err
 	}
 
 	// ssl support
 	ssl := strconv.FormatBool(c.spec.Dashboard.SSL)
-	changed, err := client.MgrSetConfig(c.context, c.clusterInfo, daemonID, "mgr/dashboard/ssl", ssl, false)
+	changed, err := monStore.SetIfChanged(daemonID, "mgr/dashboard/ssl", ssl)
 	if err != nil {
 		return false, err
 	}
@@ -125,7 +132,7 @@ func (c *Cluster) configureDashboardModuleSettings(daemonID string) (bool, error
 
 	// server port
 	port := strconv.Itoa(c.dashboardPort())
-	changed, err = client.MgrSetConfig(c.context, c.clusterInfo, daemonID, "mgr/dashboard/server_port", port, false)
+	changed, err = monStore.SetIfChanged(daemonID, "mgr/dashboard/server_port", port)
 	if err != nil {
 		return false, err
 	}
@@ -133,7 +140,7 @@ func (c *Cluster) configureDashboardModuleSettings(daemonID string) (bool, error
 
 	// SSL enabled. Needed to set specifically the ssl port setting
 	if c.spec.Dashboard.SSL {
-		changed, err = client.MgrSetConfig(c.context, c.clusterInfo, daemonID, "mgr/dashboard/ssl_server_port", port, false)
+		changed, err = monStore.SetIfChanged(daemonID, "mgr/dashboard/ssl_server_port", port)
 		if err != nil {
 			return false, err
 		}
@@ -170,12 +177,12 @@ func (c *Cluster) initializeSecureDashboard() (bool, error) {
 }
 
 func (c *Cluster) createSelfSignedCert() (bool, error) {
-	// create a self-signed cert for the https connections required in mimic
+	// create a self-signed cert for the https connections
 	args := []string{"dashboard", "create-self-signed-cert"}
 
 	// retry a few times in the case that the mgr module is not ready to accept commands
 	for i := 0; i < 5; i++ {
-		_, err := client.NewCephCommand(c.context, c.clusterInfo, args).RunWithTimeout(client.CmdExecuteTimeout)
+		_, err := client.NewCephCommand(c.context, c.clusterInfo, args).RunWithTimeout(exec.CephCommandsTimeout)
 		if err == context.DeadlineExceeded {
 			logger.Warning("cert creation timed out. trying again")
 			continue
@@ -249,8 +256,7 @@ func (c *Cluster) setLoginCredentials(password string) error {
 	}
 
 	_, err := client.ExecuteCephCommandWithRetry(func() (string, []byte, error) {
-		cmd := client.NewCephCommand(c.context, c.clusterInfo, args)
-		output, err := cmd.RunWithTimeout(client.CmdExecuteTimeout)
+		output, err := client.NewCephCommand(c.context, c.clusterInfo, args).RunWithTimeout(exec.CephCommandsTimeout)
 		return "set dashboard creds", output, err
 	}, c.exitCode, 5, invalidArgErrorCode, dashboardInitWaitTime)
 	if err != nil {

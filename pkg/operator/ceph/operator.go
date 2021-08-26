@@ -21,6 +21,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/coreos/pkg/capnslog"
@@ -48,46 +49,56 @@ const (
 	provisionerNameLegacy = "rook.io/block"
 )
 
-var logger = capnslog.NewPackageLogger("github.com/rook/rook", "operator")
-
-// The supported configurations for the volume provisioner
-var provisionerConfigs = map[string]string{
-	provisionerName:       flexvolume.FlexvolumeVendor,
-	provisionerNameLegacy: flexvolume.FlexvolumeVendorLegacy,
-}
-
 var (
+	logger = capnslog.NewPackageLogger("github.com/rook/rook", "operator")
+
+	// The supported configurations for the volume provisioner
+	provisionerConfigs = map[string]string{
+		provisionerName:       flexvolume.FlexvolumeVendor,
+		provisionerNameLegacy: flexvolume.FlexvolumeVendorLegacy,
+	}
+
 	// ImmediateRetryResult Return this for a immediate retry of the reconciliation loop with the same request object.
 	ImmediateRetryResult = reconcile.Result{Requeue: true}
+
+	// Signals to watch for to terminate the operator gracefully
+	// Using os.Interrupt is more portable across platforms instead of os.SIGINT
+	shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
 )
 
 // Operator type for managing storage
 type Operator struct {
-	context           *clusterd.Context
-	resources         []k8sutil.CustomResource
-	operatorNamespace string
-	rookImage         string
-	securityAccount   string
+	context   *clusterd.Context
+	resources []k8sutil.CustomResource
+	config    *Config
 	// The custom resource that is global to the kubernetes cluster.
 	// The cluster is global because you create multiple clusters in k8s
 	clusterController     *cluster.ClusterController
 	delayedDaemonsStarted bool
 }
 
+type Config struct {
+	OperatorNamespace string
+	Image             string
+	ServiceAccount    string
+}
+
 // New creates an operator instance
-func New(context *clusterd.Context, volumeAttachmentWrapper attachment.Attachment, rookImage, securityAccount string) *Operator {
+func New(context *clusterd.Context, volumeAttachmentWrapper attachment.Attachment, rookImage, serviceAccount string) *Operator {
 	schemes := []k8sutil.CustomResource{opcontroller.ClusterResource, attachment.VolumeResource}
 
-	operatorNamespace := os.Getenv(k8sutil.PodNamespaceEnvVar)
 	o := &Operator{
-		context:           context,
-		resources:         schemes,
-		operatorNamespace: operatorNamespace,
-		rookImage:         rookImage,
-		securityAccount:   securityAccount,
+		context:   context,
+		resources: schemes,
+		config: &Config{
+			OperatorNamespace: os.Getenv(k8sutil.PodNamespaceEnvVar),
+			Image:             rookImage,
+			ServiceAccount:    serviceAccount,
+		},
 	}
 	operatorConfigCallbacks := []func() error{
 		o.updateDrivers,
+		o.updateOperatorLogLevel,
 	}
 	addCallbacks := []func() error{
 		o.startDrivers,
@@ -101,42 +112,54 @@ func (o *Operator) cleanup(stopCh chan struct{}) {
 	o.clusterController.StopWatch()
 }
 
+func (o *Operator) updateOperatorLogLevel() error {
+	rookLogLevel, err := k8sutil.GetOperatorSetting(o.context.Clientset, opcontroller.OperatorSettingConfigMapName, "ROOK_LOG_LEVEL", "INFO")
+	if err != nil {
+		logger.Warningf("failed to load ROOK_LOG_LEVEL. Defaulting to INFO. %v", err)
+		rookLogLevel = "INFO"
+	}
+
+	logLevel, err := capnslog.ParseLevel(strings.ToUpper(rookLogLevel))
+	if err != nil {
+		return errors.Wrapf(err, "failed to load ROOK_LOG_LEVEL %q.", rookLogLevel)
+	}
+
+	capnslog.SetGlobalLogLevel(logLevel)
+	return nil
+}
+
 // Run the operator instance
 func (o *Operator) Run() error {
 
-	if o.operatorNamespace == "" {
+	if o.config.OperatorNamespace == "" {
 		return errors.Errorf("rook operator namespace is not provided. expose it via downward API in the rook operator manifest file using environment variable %q", k8sutil.PodNamespaceEnvVar)
 	}
 
-	// creating a context
-	stopContext, stopFunc := context.WithCancel(context.Background())
+	// TODO: needs a callback?
+	opcontroller.SetCephCommandsTimeout(o.context)
+
+	// Initialize signal handler and context
+	stopContext, stopFunc := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stopFunc()
 
 	rookDiscover := discover.New(o.context.Clientset)
 	if opcontroller.DiscoveryDaemonEnabled(o.context) {
-		if err := rookDiscover.Start(o.operatorNamespace, o.rookImage, o.securityAccount, true); err != nil {
+		if err := rookDiscover.Start(o.config.OperatorNamespace, o.config.Image, o.config.ServiceAccount, true); err != nil {
 			return errors.Wrap(err, "failed to start device discovery daemonset")
 		}
 	} else {
-		if err := rookDiscover.Stop(stopContext, o.operatorNamespace); err != nil {
+		if err := rookDiscover.Stop(stopContext, o.config.OperatorNamespace); err != nil {
 			return errors.Wrap(err, "failed to stop device discovery daemonset")
 		}
 	}
 
-	logger.Debug("checking for admission controller secrets")
-	err := StartControllerIfSecretPresent(stopContext, o.context, o.rookImage)
-	if err != nil {
-		return errors.Wrap(err, "failed to start webhook")
-	}
 	serverVersion, err := o.context.Clientset.Discovery().ServerVersion()
 	if err != nil {
 		return errors.Wrap(err, "failed to get server version")
 	}
 
-	// Initialize signal handler
-	signalChan := make(chan os.Signal, 1)
+	// Initialize stop channel for watchers
 	stopChan := make(chan struct{})
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// For Flex Driver, run volume provisioner for each of the supported configurations
 	if opcontroller.FlexDriverEnabled(o.context) {
@@ -156,7 +179,7 @@ func (o *Operator) Run() error {
 	var namespaceToWatch string
 	if os.Getenv("ROOK_CURRENT_NAMESPACE_ONLY") == "true" {
 		logger.Infof("watching the current namespace for a ceph cluster CR")
-		namespaceToWatch = o.operatorNamespace
+		namespaceToWatch = o.config.OperatorNamespace
 	} else {
 		logger.Infof("watching all namespaces for ceph cluster CRs")
 		namespaceToWatch = v1.NamespaceAll
@@ -164,7 +187,7 @@ func (o *Operator) Run() error {
 
 	// Start the controller-runtime Manager.
 	mgrErrorChan := make(chan error)
-	go o.startManager(namespaceToWatch, stopContext, mgrErrorChan)
+	go o.startManager(stopContext, namespaceToWatch, mgrErrorChan)
 
 	// Start the operator setting watcher
 	go o.clusterController.StartOperatorSettingsWatch(stopChan)
@@ -172,12 +195,12 @@ func (o *Operator) Run() error {
 	// Signal handler to stop the operator
 	for {
 		select {
-		case <-signalChan:
-			logger.Info("shutdown signal received, exiting...")
+		case <-stopContext.Done():
+			logger.Infof("shutdown signal received, exiting... %v", stopContext.Err())
 			o.cleanup(stopChan)
 			return nil
+
 		case err := <-mgrErrorChan:
-			logger.Errorf("gave up to run the operator. %v", err)
 			o.cleanup(stopChan)
 			return err
 		}
@@ -206,13 +229,13 @@ func (o *Operator) updateDrivers() error {
 		return nil
 	}
 
-	if o.operatorNamespace == "" {
+	if o.config.OperatorNamespace == "" {
 		return errors.Errorf("rook operator namespace is not provided. expose it via downward API in the rook operator manifest file using environment variable %s", k8sutil.PodNamespaceEnvVar)
 	}
 
 	if opcontroller.FlexDriverEnabled(o.context) {
 		rookAgent := agent.New(o.context.Clientset)
-		if err := rookAgent.Start(o.operatorNamespace, o.rookImage, o.securityAccount); err != nil {
+		if err := rookAgent.Start(o.config.OperatorNamespace, o.config.Image, o.config.ServiceAccount); err != nil {
 			return errors.Wrap(err, "error starting agent daemonset")
 		}
 	}
@@ -220,10 +243,6 @@ func (o *Operator) updateDrivers() error {
 	serverVersion, err := o.context.Clientset.Discovery().ServerVersion()
 	if err != nil {
 		return errors.Wrap(err, "error getting server version")
-	}
-
-	if err = csi.SetParams(o.context.Clientset); err != nil {
-		return errors.Wrap(err, "failed to configure CSI parameters")
 	}
 
 	if serverVersion.Major < csi.KubeMinMajor || serverVersion.Major == csi.KubeMinMajor && serverVersion.Minor < csi.ProvDeploymentSuppVersion {
@@ -234,7 +253,7 @@ func (o *Operator) updateDrivers() error {
 		return nil
 	}
 
-	ownerRef, err := getDeploymentOwnerReference(o.context.Clientset, o.operatorNamespace)
+	ownerRef, err := getDeploymentOwnerReference(o.context.Clientset, o.config.OperatorNamespace)
 	if err != nil {
 		logger.Warningf("could not find deployment owner reference to assign to csi drivers. %v", err)
 	}
@@ -243,19 +262,15 @@ func (o *Operator) updateDrivers() error {
 		ownerRef.BlockOwnerDeletion = &blockOwnerDeletion
 	}
 
-	ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, o.operatorNamespace)
+	ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, o.config.OperatorNamespace)
 	// create an empty config map. config map will be filled with data
 	// later when clusters have mons
-	err = csi.CreateCsiConfigMap(o.operatorNamespace, o.context.Clientset, ownerInfo)
+	err = csi.CreateCsiConfigMap(o.config.OperatorNamespace, o.context.Clientset, ownerInfo)
 	if err != nil {
 		return errors.Wrap(err, "failed creating csi config map")
 	}
 
-	if err = csi.ValidateCSIParam(); err != nil {
-		return errors.Wrap(err, "invalid csi params")
-	}
-
-	go csi.ValidateAndConfigureDrivers(o.context, o.operatorNamespace, o.rookImage, o.securityAccount, serverVersion, ownerInfo)
+	go csi.ValidateAndConfigureDrivers(o.context, o.config.OperatorNamespace, o.config.Image, o.config.ServiceAccount, serverVersion, ownerInfo)
 	return nil
 }
 

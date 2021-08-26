@@ -1,6 +1,6 @@
 # Major Themes
 
-v1.7...
+v1.8...
 
 ## K8s Version Support
 
@@ -15,3 +15,7 @@ v1.7...
 ### Core
 
 ### Ceph
+
+### Cassandra
+
+### NFS

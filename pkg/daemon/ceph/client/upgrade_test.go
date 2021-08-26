@@ -71,7 +71,6 @@ func TestEnableReleaseOSDFunctionality(t *testing.T) {
 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		assert.Equal(t, "osd", args[0])
 		assert.Equal(t, "require-osd-release", args[1])
-		assert.Equal(t, 3, len(args))
 		return "", nil
 	}
 	context := &clusterd.Context{Executor: executor}
@@ -142,8 +141,8 @@ func TestDaemonMapEntry(t *testing.T) {
 	dummyVersionsRaw := []byte(`
 	{
 		"mon": {
-			"ceph version 13.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) mimic (stable)": 1,
-			"ceph version 14.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) nautilus (stable)": 2
+			"ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 1,
+			"ceph version 17.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) quincy (stable)": 2
 		}
 	}`)
 
@@ -306,7 +305,7 @@ func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
 	treeOutput := ""
 	context := &clusterd.Context{
 		Executor: &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				t.Logf("command: %s %v", command, args)
 				if command != "ceph" || args[0] != "osd" {
 					panic("not a 'ceph osd' call")
@@ -356,6 +355,13 @@ func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
 	t.Run("0 nodes", func(t *testing.T) {
 		lsOutput = fake.OsdLsOutput(0)
 		treeOutput = fake.OsdTreeOutput(0, 0)
+		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
+	})
+
+	// degraded case, OSDs are failing to start so they haven't registered in the CRUSH map yet
+	t.Run("0 nodes with down OSDs", func(t *testing.T) {
+		lsOutput = fake.OsdLsOutput(3)
+		treeOutput = fake.OsdTreeOutput(0, 1)
 		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
 	})
 }
