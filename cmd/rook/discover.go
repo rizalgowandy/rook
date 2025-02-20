@@ -26,8 +26,9 @@ import (
 
 var (
 	discoverCmd = &cobra.Command{
-		Use:   "discover",
-		Short: "Discover devices",
+		Use:    "discover",
+		Short:  "Discover devices",
+		Hidden: true, // do not advertise to end users
 	}
 
 	// interval between discovering devices
@@ -51,8 +52,9 @@ func startDiscover(cmd *cobra.Command, args []string) error {
 	rook.LogStartupInfo(discoverCmd.Flags())
 
 	context := rook.NewContext()
+	ctx := cmd.Context()
 
-	err := discover.Run(context, discoverDevicesInterval, usesCVInventory)
+	err := discover.Run(ctx, context, discoverDevicesInterval, usesCVInventory)
 	if err != nil {
 		rook.TerminateFatal(err)
 	}

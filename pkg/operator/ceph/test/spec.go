@@ -18,6 +18,7 @@ package test
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -69,12 +70,12 @@ func VerifyPodLabels(appName, namespace, daemonType, daemonID string, labels map
 	return combineErrors(errA, errB, errC)
 }
 
-// AssertLabelsContainCephRequirements asserts that the the labels under test contain the labels
+// AssertLabelsContainCephRequirements asserts that the labels under test contain the labels
 // which all Ceph pods should have. This can be used with labels for Kubernetes Deployments,
 // DaemonSets, etc.
 func AssertLabelsContainCephRequirements(
 	t *testing.T, labels map[string]string,
-	daemonType, daemonID, appName, namespace string,
+	daemonType, daemonID, appName, namespace, parentName, resourceKind, appBinaryName string,
 ) {
 	optest.AssertLabelsContainRookRequirements(t, labels, appName)
 
@@ -83,8 +84,15 @@ func AssertLabelsContainCephRequirements(
 		resourceLabels = append(resourceLabels, fmt.Sprintf("%s=%s", k, v))
 	}
 	expectedLabels := []string{
+		"app.kubernetes.io/created-by=rook-ceph-operator",
+		"app.kubernetes.io/component=" + resourceKind,
+		"app.kubernetes.io/instance=" + daemonID,
+		"app.kubernetes.io/name=" + appBinaryName,
+		"app.kubernetes.io/managed-by=rook-ceph-operator",
+		"app.kubernetes.io/part-of=" + parentName,
 		"ceph_daemon_id=" + daemonID,
 		string(daemonType) + "=" + daemonID,
+		"rook.io/operator-namespace=" + os.Getenv("POD_NAMESPACE"),
 		"rook_cluster" + "=" + namespace,
 	}
 	assert.Subset(t, resourceLabels, expectedLabels,

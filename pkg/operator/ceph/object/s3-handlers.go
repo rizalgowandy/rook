@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,57 +22,56 @@ import (
 	"crypto/x509"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
+	awssession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/pkg/errors"
 )
+
+// Region for aws golang sdk
+const CephRegion = "us-east-1"
 
 // S3Agent wraps the s3.S3 structure to allow for wrapper methods
 type S3Agent struct {
 	Client *s3.S3
 }
 
-func NewS3Agent(accessKey, secretKey, endpoint string, debug bool, tlsCert []byte) (*S3Agent, error) {
-	const cephRegion = "us-east-1"
-
+func NewS3Agent(accessKey, secretKey, endpoint string, debug bool, tlsCert []byte, insecure bool, httpClient *http.Client) (*S3Agent, error) {
 	logLevel := aws.LogOff
 	if debug {
 		logLevel = aws.LogDebug
 	}
-	client := http.Client{
-		Timeout: time.Second * 15,
-	}
 	tlsEnabled := false
-	if len(tlsCert) > 0 {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(tlsCert)
-
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12},
-		}
-		client.Transport = tr
+	if len(tlsCert) > 0 || insecure {
 		tlsEnabled = true
 	}
-	sess, err := session.NewSession(
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: HttpTimeOut,
+		}
+		if tlsEnabled {
+			httpClient.Transport = BuildTransportTLS(tlsCert, insecure)
+		}
+	}
+
+	session, err := awssession.NewSession(
 		aws.NewConfig().
-			WithRegion(cephRegion).
+			WithRegion(CephRegion).
 			WithCredentials(credentials.NewStaticCredentials(accessKey, secretKey, "")).
 			WithEndpoint(endpoint).
 			WithS3ForcePathStyle(true).
 			WithMaxRetries(5).
 			WithDisableSSL(!tlsEnabled).
-			WithHTTPClient(&client).
+			WithHTTPClient(httpClient).
 			WithLogLevel(logLevel),
 	)
 	if err != nil {
 		return nil, err
 	}
-	svc := s3.New(sess)
+	svc := s3.New(session)
 	return &S3Agent{
 		Client: svc,
 	}, nil
@@ -97,6 +96,7 @@ func (s *S3Agent) createBucket(name string, infoLogging bool) error {
 	bucketInput := &s3.CreateBucketInput{
 		Bucket: &name,
 	}
+
 	_, err := s.Client.CreateBucket(bucketInput)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -192,4 +192,24 @@ func (s *S3Agent) DeleteObjectInBucket(bucketname string, key string) (bool, err
 
 	}
 	return true, nil
+}
+
+func BuildTransportTLS(tlsCert []byte, insecure bool) *http.Transport {
+	//nolint:gosec // is enabled only for testing
+	tlsConfig := &tls.Config{InsecureSkipVerify: insecure}
+	var caCertPool *x509.CertPool
+	var err error
+	caCertPool, err = x509.SystemCertPool()
+	if err != nil {
+		logger.Warningf("failed to load system cert pool; continuing without loading system certs")
+		caCertPool = x509.NewCertPool() // start with empty cert pool instead
+	}
+	if len(tlsCert) > 0 {
+		caCertPool.AppendCertsFromPEM(tlsCert)
+	}
+	tlsConfig.RootCAs = caCertPool
+
+	return &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
 }

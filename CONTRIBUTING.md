@@ -41,7 +41,7 @@ request and branch commits.
 ## Getting Started
 
 1. Fork the repository on GitHub
-1. Read the [install](INSTALL.md) for build and test instructions
+1. Read the [install](INSTALL.md) document for build and test instructions
 1. Play with the project, submit bugs, submit patches!
 
 ## Contribution Flow
@@ -55,7 +55,7 @@ This is a rough outline of what a contributor's workflow looks like:
 1. Make sure all tests pass, and add any new tests as appropriate.
 1. Submit a pull request to the original repository.
 
-For detailed contribution instructions, refer to the [development flow](Documentation/development-flow.md).
+For detailed contribution instructions, refer to the [development flow](Documentation/Contributing/development-flow.md).
 
 ## Coding Style
 
@@ -174,6 +174,6 @@ We should explore this further with some experimentation and potentially leverag
 
 ### Alternatives Considered
 
-The built in support in Github for [`CODEOWNERS`](https://help.github.com/en/articles/about-code-owners) files was considered.
+The built in support in GitHub for [`CODEOWNERS`](https://help.github.com/en/articles/about-code-owners) files was considered.
 However, this only supports the automated assignment of reviewers to pull requests.
 It has no tiering or differentiation between roles like the proposed maintainers/reviewers model has and is therefore not a good fit.

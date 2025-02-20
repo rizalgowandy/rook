@@ -18,7 +18,10 @@ limitations under the License.
 package cluster
 
 import (
+	"context"
+
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	discoverDaemon "github.com/rook/rook/pkg/daemon/discover"
@@ -26,23 +29,48 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+func shouldReconcileChangedNode(objOld, objNew *corev1.Node) bool {
+	// do not watch node if only resourceversion got changed
+	resourceQtyComparer := cmpopts.IgnoreFields(v1.ObjectMeta{}, "ResourceVersion")
+	diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+
+	// do not watch node if only LastHeartbeatTime got changed
+	resourceQtyComparer = cmpopts.IgnoreFields(corev1.NodeCondition{}, "LastHeartbeatTime")
+	diff1 := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+
+	if diff == "" && diff1 == "" {
+		return false
+	}
+	return true
+}
+
 // predicateForNodeWatcher is the predicate function to trigger reconcile on Node events
-func predicateForNodeWatcher(client client.Client, context *clusterd.Context) predicate.Funcs {
+func predicateForNodeWatcher(ctx context.Context, client client.Client, context *clusterd.Context, opNamespace string) predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			clientCluster := newClientCluster(client, e.Object.GetNamespace(), context)
-			return clientCluster.onK8sNode(e.Object)
+			return clientCluster.onK8sNode(ctx, e.Object, opNamespace)
 		},
 
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			clientCluster := newClientCluster(client, e.ObjectNew.GetNamespace(), context)
-			return clientCluster.onK8sNode(e.ObjectNew)
+			if objOld, ok := e.ObjectOld.(*corev1.Node); ok {
+				if objNew, ok := e.ObjectNew.(*corev1.Node); ok {
+					if !shouldReconcileChangedNode(objOld, objNew) {
+						return false
+					}
+
+					clientCluster := newClientCluster(client, e.ObjectNew.GetNamespace(), context)
+					return clientCluster.onK8sNode(ctx, e.ObjectNew, opNamespace)
+				}
+			}
+			return false
 		},
 
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -61,7 +89,6 @@ func predicateForHotPlugCMWatcher(client client.Client) predicate.Funcs {
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			isHotPlugCM := isHotPlugCM(e.ObjectNew)
 			if !isHotPlugCM {
-				logger.Debugf("hot-plug cm watcher: only reconcile on hot plug cm changes, this %q cm is handled by another watcher", e.ObjectNew.GetName())
 				return false
 			}
 
@@ -105,9 +132,12 @@ func isHotPlugCM(obj runtime.Object) bool {
 	return false
 }
 
-func watchControllerPredicate(rookContext *clusterd.Context) predicate.Funcs {
+func watchControllerPredicate(ctx context.Context, c client.Client) predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
+			if controller.DuplicateCephClusters(ctx, c, e.Object, true) {
+				return false
+			}
 			logger.Debug("create event from a CR")
 			return true
 		},
@@ -116,7 +146,13 @@ func watchControllerPredicate(rookContext *clusterd.Context) predicate.Funcs {
 			return true
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			logger.Debug("update event from a CR")
+			// We still need to check on update event since the user must delete the additional CR
+			// Until this is done, the user can still update the CR and the operator will reconcile
+			// This should not happen
+			if controller.DuplicateCephClusters(ctx, c, e.ObjectOld, true) {
+				return false
+			}
+
 			// resource.Quantity has non-exportable fields, so we use its comparator method
 			resourceQtyComparer := cmp.Comparer(func(x, y resource.Quantity) bool { return x.Cmp(y) == 0 })
 
@@ -132,18 +168,25 @@ func watchControllerPredicate(rookContext *clusterd.Context) predicate.Funcs {
 				}
 				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
 				if diff != "" {
-					// Set the cancellation flag to stop any ongoing orchestration
-					rookContext.RequestCancelOrchestration.Set()
-
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
-					return true
 
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
-					// Set the cancellation flag to stop any ongoing orchestration
-					rookContext.RequestCancelOrchestration.Set()
+					if objNew.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
+						logger.Infof("skipping orchestration for cluster object %q in namespace %q because its cleanup policy is set. not reloading the manager", objNew.GetName(), objNew.GetNamespace())
+						return false
+					}
 
+					// Stop any ongoing orchestration
+					controller.ReloadManager()
+
+					return false
+
+				} else if !objOld.GetDeletionTimestamp().Equal(objNew.GetDeletionTimestamp()) {
 					logger.Infof("CR %q is going be deleted, cancelling any ongoing orchestration", objNew.Name)
-					return true
+
+					// Stop any ongoing orchestration
+					controller.ReloadManager()
+
+					return false
 
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
 					logger.Debugf("skipping resource %q update with unchanged spec", objNew.Name)

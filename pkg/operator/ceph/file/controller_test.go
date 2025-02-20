@@ -19,22 +19,28 @@ package file
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/test"
+	"github.com/rook/rook/pkg/util/dependents"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -136,7 +142,7 @@ const (
 	dummyVersionsRaw          = `
 	{
 		"mon": {
-			"ceph version 14.2.8 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) nautilus (stable)": 3
+			"ceph version 19.2.1 (000000000000000000000000000000) squid (stable)": 3
 		}
 	}`
 )
@@ -152,11 +158,10 @@ func TestCephFilesystemController(t *testing.T) {
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
 
-	//
-	// TEST 1 SETUP
-	//
-	// FAILURE because no CephCluster
-	//
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+		return &version.Reef, &version.Reef, nil
+	}
+
 	// A Pool resource with metadata and spec.
 	fs := &cephv1.CephFilesystem{
 		ObjectMeta: metav1.ObjectMeta{
@@ -177,7 +182,7 @@ func TestCephFilesystemController(t *testing.T) {
 	}
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
@@ -203,7 +208,14 @@ func TestCephFilesystemController(t *testing.T) {
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 	// Create a ReconcileCephFilesystem object with the scheme and fake client.
-	r := &ReconcileCephFilesystem{client: cl, scheme: s, context: c}
+	r := &ReconcileCephFilesystem{
+		client:           cl,
+		recorder:         record.NewFakeRecorder(5),
+		scheme:           s,
+		context:          c,
+		fsContexts:       make(map[string]*fsHealth),
+		opManagerContext: context.TODO(),
+	}
 
 	// Mock request to simulate Reconcile() being called on an event for a
 	// watched resource .
@@ -213,17 +225,6 @@ func TestCephFilesystemController(t *testing.T) {
 			Namespace: namespace,
 		},
 	}
-	logger.Info("STARTING PHASE 1")
-	res, err := r.Reconcile(ctx, req)
-	assert.NoError(t, err)
-	assert.True(t, res.Requeue)
-	logger.Info("PHASE 1 DONE")
-
-	//
-	// TEST 2:
-	//
-	// FAILURE we have a cluster but it's not ready
-	//
 	cephCluster := &cephv1.CephCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      namespace,
@@ -236,75 +237,193 @@ func TestCephFilesystemController(t *testing.T) {
 			},
 		},
 	}
-	object = append(object, cephCluster)
-	// Create a fake client to mock API calls.
-	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
-	// Create a ReconcileCephFilesystem object with the scheme and fake client.
-	r = &ReconcileCephFilesystem{client: cl, scheme: s, context: c}
-	logger.Info("STARTING PHASE 2")
-	res, err = r.Reconcile(ctx, req)
-	assert.NoError(t, err)
-	assert.True(t, res.Requeue)
-	logger.Info("PHASE 2 DONE")
 
-	//
-	// TEST 3:
-	//
-	// SUCCESS! The CephCluster is ready
-	//
+	t.Run("error - no ceph cluster", func(t *testing.T) {
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+	})
 
-	// Mock clusterInfo
-	secrets := map[string][]byte{
-		"fsid":         []byte(name),
-		"mon-secret":   []byte("monsecret"),
-		"admin-secret": []byte("adminsecret"),
-	}
-	secret := &v1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "rook-ceph-mon",
-			Namespace: namespace,
-		},
-		Data: secrets,
-		Type: k8sutil.RookType,
-	}
-	_, err = c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
-	assert.NoError(t, err)
+	t.Run("error - ceph cluster not ready", func(t *testing.T) {
+		object = append(object, cephCluster)
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		// Create a ReconcileCephFilesystem object with the scheme and fake client.
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         record.NewFakeRecorder(5),
+			scheme:           s,
+			context:          c,
+			opManagerContext: context.TODO(),
+		}
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+		logger.Info("PHASE 2 DONE")
+	})
 
-	// Add ready status to the CephCluster
-	cephCluster.Status.Phase = k8sutil.ReadyStatus
-	cephCluster.Status.CephStatus.Health = "HEALTH_OK"
+	t.Run("success - ceph cluster ready and mds are running", func(t *testing.T) {
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
 
-	// Create a fake client to mock API calls.
-	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		// Add ready status to the CephCluster
+		cephCluster.Status.Phase = k8sutil.ReadyStatus
+		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
 
-	executor = &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
-			if args[0] == "status" {
-				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		executor = &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[0] == "status" {
+					return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+				}
+				if args[0] == "fs" && args[1] == "get" {
+					return fsGet, nil
+				}
+				if args[0] == "auth" && args[1] == "get-or-create-key" {
+					return mdsCephAuthGetOrCreateKey, nil
+				}
+				if args[0] == "versions" {
+					return dummyVersionsRaw, nil
+				}
+				return "", nil
+			},
+		}
+		c.Executor = executor
+
+		// Create a ReconcileCephFilesystem object with the scheme and fake client.
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         record.NewFakeRecorder(5),
+			scheme:           s,
+			context:          c,
+			fsContexts:       make(map[string]*fsHealth),
+			opManagerContext: context.TODO(),
+		}
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		err = r.client.Get(context.TODO(), req.NamespacedName, fs)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.ConditionType("Ready"), fs.Status.Phase, fs)
+	})
+
+	t.Run("block for dependents", func(t *testing.T) {
+		clientset := test.New(t, 3)
+		c := &clusterd.Context{
+			Executor:      executor,
+			RookClientset: rookclient.NewSimpleClientset(),
+			Clientset:     clientset,
+		}
+
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Add ready status to the CephCluster
+		cephCluster := cephCluster.DeepCopy()
+		cephCluster.Status.Phase = k8sutil.ReadyStatus
+		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
+
+		fs := fs.DeepCopy()
+		fs.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(fs, cephCluster).Build()
+
+		executor = &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[0] == "status" {
+					return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+				}
+				if args[0] == "fs" && args[1] == "get" {
+					return fsGet, nil
+				}
+				if args[0] == "auth" && args[1] == "get-or-create-key" {
+					return mdsCephAuthGetOrCreateKey, nil
+				}
+				if args[0] == "versions" {
+					return dummyVersionsRaw, nil
+				}
+				panic(fmt.Sprintf("unhandled MockExecuteCommandWithOutput command %q %v", command, args))
+			},
+		}
+		c.Executor = executor
+
+		// subvolume group to act as dependent
+		cephFsSubvolGroup := &cephv1.CephFilesystemSubVolumeGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "group-a",
+				Namespace: namespace,
+			},
+			Spec: cephv1.CephFilesystemSubVolumeGroupSpec{
+				FilesystemName: name,
+			},
+		}
+		_, err = c.RookClientset.CephV1().CephFilesystemSubVolumeGroups(namespace).Create(ctx, cephFsSubvolGroup, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Create a ReconcileCephFilesystem object with the scheme and fake client.
+		fakeRecorder := record.NewFakeRecorder(5)
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         fakeRecorder,
+			scheme:           s,
+			context:          c,
+			fsContexts:       make(map[string]*fsHealth),
+			opManagerContext: context.TODO(),
+		}
+
+		oldCephFSDeps := CephFilesystemDependents
+		defer func() {
+			CephFilesystemDependents = oldCephFSDeps
+		}()
+
+		t.Run("block on dependents", func(t *testing.T) {
+			CephFilesystemDependents = func(
+				clusterdCtx *clusterd.Context, clusterInfo *client.ClusterInfo, filesystem *cephv1.CephFilesystem,
+			) (*dependents.DependentList, error) {
+				deps := dependents.NewDependentList()
+				deps.Add("TestDependent", "fake-dependent")
+				return deps, nil
 			}
-			if args[0] == "fs" && args[1] == "get" {
-				return fsGet, nil
-			}
-			if args[0] == "auth" && args[1] == "get-or-create-key" {
-				return mdsCephAuthGetOrCreateKey, nil
-			}
-			if args[0] == "versions" {
-				return dummyVersionsRaw, nil
-			}
-			return "", nil
-		},
-	}
-	c.Executor = executor
 
-	// Create a ReconcileCephFilesystem object with the scheme and fake client.
-	r = &ReconcileCephFilesystem{client: cl, scheme: s, context: c}
-
-	logger.Info("STARTING PHASE 3")
-	res, err = r.Reconcile(ctx, req)
-	assert.NoError(t, err)
-	assert.False(t, res.Requeue)
-	err = r.client.Get(context.TODO(), req.NamespacedName, fs)
-	assert.NoError(t, err)
-	assert.Equal(t, "Ready", fs.Status.Phase, fs)
-	logger.Info("PHASE 3 DONE")
+			res, err := r.Reconcile(ctx, req)
+			assert.NoError(t, err)
+			assert.False(t, res.IsZero())
+			assert.Len(t, fakeRecorder.Events, 1)
+			event := <-fakeRecorder.Events
+			assert.Contains(t, event, "TestDependent")
+			assert.Contains(t, event, "fake-dependent")
+		})
+	})
 }

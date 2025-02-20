@@ -9,8 +9,8 @@ This page lists all active contributors and their areas of expertise. This can b
 
 Steering committee members will be added according to the [process for adding a steering committee member](GOVERNANCE.md#becoming-a-steering-committee-member) in the [governance](GOVERNANCE.md).
 
-| Name                                 | Represents  | Github                                |
-| ------------------------------------ | ----------- | ------------------------------------- |
+| Name                                 | Represents  | GitHub                                |
+| ------------------------------------ | ----------- |---------------------------------------|
 | Travis Nielsen <tnielsen@redhat.com> | Ceph        | [travisn](https://github.com/travisn) |
 | Jared Watts <jared@upbound.io>       | Independent | [jbw976](https://github.com/jbw976)   |
 
@@ -19,19 +19,13 @@ Steering committee members will be added according to the [process for adding a 
 Maintainers will be added according to the [process for adding a maintainer](GOVERNANCE.md#becoming-a-maintainer) in the [governance](GOVERNANCE.md).
 
 * Travis Nielsen <tnielsen@redhat.com> ([travisn](https://github.com/travisn))
-  * Ceph, Operators/Orchestration
 * Jared Watts <jared@upbound.io> ([jbw976](https://github.com/jbw976))
-  * Framework, APIs
 * Alexander Trost <galexrt@googlemail.com> ([galexrt](https://github.com/galexrt))
-  * Ceph, Operators/Orchestration, User support
 * Sebastien Han <shan@redhat.com> ([leseb](https://github.com/leseb))
-  * Ceph
 * Blaine Gardner <blaine.gardner@redhat.com> ([BlaineEXE](https://github.com/BlaineEXE))
-  * Ceph
-* Yannis Zarkadas <yanniszarkadas@gmail.com> ([yanniszark](https://github.com/yanniszark))
-  * Cassandra
 * Satoru Takeuchi <satoru.takeuchi@gmail.com> ([satoru-takeuchi](https://github.com/satoru-takeuchi))
-  * Ceph
+* Subham Rai <srai@redhat.com> ([subhamkrai](https://github.com/subhamkrai))
+* Santosh Pillai <sapillai@redhat.com> ([sp98](https://github.com/sp98))
 
 ## Emeritus maintainers
 
@@ -39,6 +33,7 @@ This list will be updated according to the [process for removing a maintainer](G
 
 * Bassam Tabbara <bassam@upbound.io> ([bassam](https://github.com/bassam))
 * Dmitry Yusupov <dmitry.yusupov@gmail.com> ([dyusupov](https://github.com/dyusupov))
+* Yannis Zarkadas <yanniszarkadas@gmail.com> ([yanniszark](https://github.com/yanniszark))
 
 ## Code Owners
 
@@ -47,5 +42,5 @@ Code owners, as described in the [change approval process](GOVERNANCE.md#change-
 ## Community
 
 We are grateful for the countless members of the community who contribute to Rook,
-whether reporting issues in Github or Slack or submitting code or documentation PRs.
+whether reporting issues in GitHub or Slack or submitting code or documentation PRs.
 Thank you for helping this project to grow and mature!

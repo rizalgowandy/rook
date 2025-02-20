@@ -25,6 +25,7 @@ import (
 	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
+	"github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/pkg/operator/test"
 
 	"github.com/rook/rook/pkg/clusterd"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -46,7 +48,7 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "zonegroup-a",
 		"api_name": "zonegroup-a",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [
 			":80"
 		],
@@ -130,6 +132,24 @@ func TestCephObjectZoneController(t *testing.T) {
 	zonegroup := "zonegroup-a"
 	namespace := "rook-ceph"
 
+	createPoolsCalled := false
+	createObjectStorePoolsFunc = func(context *object.Context, cluster *cephv1.ClusterSpec, metadataPool, dataPool cephv1.PoolSpec) error {
+		createPoolsCalled = true
+		return nil
+	}
+	defer func() {
+		createObjectStorePoolsFunc = object.CreateObjectStorePools
+	}()
+
+	commitChangesCalled := false
+	commitConfigChangesFunc = func(c *object.Context) error {
+		commitChangesCalled = true
+		return nil
+	}
+	defer func() {
+		commitConfigChangesFunc = object.CommitConfigChanges
+	}()
+
 	//
 	// TEST 1 SETUP
 	//
@@ -140,8 +160,9 @@ func TestCephObjectZoneController(t *testing.T) {
 	dataPool := cephv1.PoolSpec{}
 	objectZone := &cephv1.CephObjectZone{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Generation: 0,
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "CephObjectZone",
@@ -159,7 +180,7 @@ func TestCephObjectZoneController(t *testing.T) {
 	}
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
@@ -182,9 +203,9 @@ func TestCephObjectZoneController(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	// Create a ReconcileObjectZone object with the scheme and fake client.
-	clusterInfo := cephclient.AdminClusterInfo("rook")
+	clusterInfo := cephclient.AdminTestClusterInfo("rook")
 
-	r := &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	r := &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: record.NewFakeRecorder(5)}
 
 	// Mock request to simulate Reconcile() being called on an event for a
 	// watched resource .
@@ -226,7 +247,7 @@ func TestCephObjectZoneController(t *testing.T) {
 	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	// Create a ReconcileObjectZone object with the scheme and fake client.
-	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context, recorder: record.NewFakeRecorder(5)}
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
@@ -262,7 +283,7 @@ func TestCephObjectZoneController(t *testing.T) {
 	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	executor = &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
@@ -277,10 +298,10 @@ func TestCephObjectZoneController(t *testing.T) {
 	}
 	r.context.Executor = executor
 
-	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context, recorder: record.NewFakeRecorder(5)}
 
 	res, err = r.Reconcile(ctx, req)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
 
 	//
@@ -308,7 +329,7 @@ func TestCephObjectZoneController(t *testing.T) {
 	}
 
 	executor = &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
@@ -342,7 +363,7 @@ func TestCephObjectZoneController(t *testing.T) {
 
 	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
-	r = &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	r = &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: record.NewFakeRecorder(5)}
 
 	err = r.client.Get(context.TODO(), types.NamespacedName{Name: zonegroup, Namespace: namespace}, objectZoneGroup)
 	assert.NoError(t, err, objectZoneGroup)
@@ -354,9 +375,13 @@ func TestCephObjectZoneController(t *testing.T) {
 		},
 	}
 
+	assert.False(t, createPoolsCalled)
+	assert.False(t, commitChangesCalled)
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.False(t, res.Requeue)
 	err = r.client.Get(context.TODO(), req.NamespacedName, objectZone)
 	assert.NoError(t, err)
+	assert.True(t, createPoolsCalled)
+	assert.True(t, commitChangesCalled)
 }

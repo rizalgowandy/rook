@@ -22,10 +22,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
 	rookfake "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/agent/flexvolume/attachment"
 	testop "github.com/rook/rook/pkg/operator/test"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,19 +48,7 @@ func TestCleanupJobSpec(t *testing.T) {
 		Clientset:     clientset,
 		RookClientset: rookfake.NewSimpleClientset(),
 	}
-	operatorConfigCallbacks := []func() error{
-		func() error {
-			logger.Infof("test success callback")
-			return nil
-		},
-	}
-	addCallbacks := []func() error{
-		func() error {
-			logger.Infof("test success callback")
-			return nil
-		},
-	}
-	controller := NewClusterController(context, "", &attachment.MockAttachment{}, operatorConfigCallbacks, addCallbacks)
+	controller := NewClusterController(context, "")
 	podTemplateSpec := controller.cleanUpJobTemplateSpec(cluster, "monSecret", "28b87851-8dc1-46c8-b1ec-90ec51a47c89")
 	assert.Equal(t, expectedHostPath, podTemplateSpec.Spec.Containers[0].Env[0].Value)
 	assert.Equal(t, expectedNamespace, podTemplateSpec.Spec.Containers[0].Env[1].Value)
@@ -72,32 +58,32 @@ func TestCleanupPlacement(t *testing.T) {
 	// no tolerations end up in an empty list of tolerations
 	c := cephv1.ClusterSpec{}
 	p := getCleanupPlacement(c)
-	assert.Equal(t, rookv1.Placement{}, p)
+	assert.Equal(t, cephv1.Placement{}, p)
 
 	// add tolerations for each of the daemons
-	c.Placement = rookv1.PlacementSpec{}
-	c.Placement[rookv1.KeyAll] = rookv1.Placement{Tolerations: []v1.Toleration{{Key: "allToleration"}}}
+	c.Placement = cephv1.PlacementSpec{}
+	c.Placement[cephv1.KeyAll] = cephv1.Placement{Tolerations: []v1.Toleration{{Key: "allToleration"}}}
 	p = getCleanupPlacement(c)
-	assert.Equal(t, c.Placement[rookv1.KeyAll], p)
+	assert.Equal(t, c.Placement[cephv1.KeyAll], p)
 
-	c.Placement[cephv1.KeyMon] = rookv1.Placement{Tolerations: []v1.Toleration{{Key: "monToleration"}}}
+	c.Placement[cephv1.KeyMon] = cephv1.Placement{Tolerations: []v1.Toleration{{Key: "monToleration"}}}
 	p = getCleanupPlacement(c)
 	assert.Equal(t, 2, len(p.Tolerations))
 
-	c.Placement[cephv1.KeyMgr] = rookv1.Placement{Tolerations: []v1.Toleration{{Key: "mgrToleration"}}}
+	c.Placement[cephv1.KeyMgr] = cephv1.Placement{Tolerations: []v1.Toleration{{Key: "mgrToleration"}}}
 	p = getCleanupPlacement(c)
 	assert.Equal(t, 3, len(p.Tolerations))
 
-	c.Placement[cephv1.KeyMonArbiter] = rookv1.Placement{Tolerations: []v1.Toleration{{Key: "monArbiterToleration"}}}
+	c.Placement[cephv1.KeyMonArbiter] = cephv1.Placement{Tolerations: []v1.Toleration{{Key: "monArbiterToleration"}}}
 	p = getCleanupPlacement(c)
 	assert.Equal(t, 4, len(p.Tolerations))
 
-	c.Placement[cephv1.KeyOSD] = rookv1.Placement{Tolerations: []v1.Toleration{{Key: "osdToleration"}}}
+	c.Placement[cephv1.KeyOSD] = cephv1.Placement{Tolerations: []v1.Toleration{{Key: "osdToleration"}}}
 	p = getCleanupPlacement(c)
 	assert.Equal(t, 5, len(p.Tolerations))
 
-	c.Storage.StorageClassDeviceSets = []rookv1.StorageClassDeviceSet{
-		{Placement: rookv1.Placement{Tolerations: []v1.Toleration{{Key: "deviceSetToleration"}}}},
+	c.Storage.StorageClassDeviceSets = []cephv1.StorageClassDeviceSet{
+		{Placement: cephv1.Placement{Tolerations: []v1.Toleration{{Key: "deviceSetToleration"}}}},
 	}
 	p = getCleanupPlacement(c)
 	assert.Equal(t, 6, len(p.Tolerations))

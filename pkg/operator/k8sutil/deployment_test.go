@@ -72,23 +72,25 @@ func TestUpdateMultipleDeploymentsAndWait(t *testing.T) {
 		return d
 	}
 
-	timesCalled := 0
+	timesCalled := int32(0)
 	// generate a status that is not ready when first called but becomes ready later
-	status := func(timesCalled int) appsv1.DeploymentStatus {
+	status := func(timesCalled int32) appsv1.DeploymentStatus {
 		if timesCalled < 0 {
 			timesCalled = 0
 		}
 		return appsv1.DeploymentStatus{
 			ObservedGeneration: int64(timesCalled),
-			UpdatedReplicas:    int32(timesCalled),
-			ReadyReplicas:      int32(timesCalled),
+			//nolint:gosec // G115 widening cast - no integer overflow
+			UpdatedReplicas: int32(timesCalled),
+			//nolint:gosec // G115 widening cast - no integer overflow
+			ReadyReplicas: int32(timesCalled),
 			Conditions: []appsv1.DeploymentCondition{
 				{Type: appsv1.DeploymentProgressing, Reason: "DoinStuff"},
 			},
 		}
 	}
 	// generate a deployment with no errors and status=status(timesCalled)
-	okayDeployment := func(name string, timesCalled int) appsv1.Deployment {
+	okayDeployment := func(name string, timesCalled int32) appsv1.Deployment {
 		return appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
@@ -146,7 +148,7 @@ func TestUpdateMultipleDeploymentsAndWait(t *testing.T) {
 			timesCalled++
 			return l, nil
 		}
-		failures = UpdateMultipleDeploymentsAndWait(clientset, deployments, listFunc)
+		failures = UpdateMultipleDeploymentsAndWait(context.TODO(), clientset, deployments, listFunc)
 		assert.Len(t, failures, 3)
 		assert.ElementsMatch(t,
 			[]string{failures[0].ResourceName, failures[1].ResourceName, failures[2].ResourceName},
@@ -191,7 +193,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 	t.Run("no deployments to be updated", func(t *testing.T) {
 		clientset = fake.NewSimpleClientset()
 		deployments = []*appsv1.Deployment{}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(context.TODO(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 0)
 		assert.Len(t, failures, 0)
 	})
@@ -206,7 +208,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 			modifiedDeployment("d2", nil),
 			modifiedDeployment("d3", nil),
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(context.TODO(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 3)
 		assert.Len(t, failures, 0)
 		assert.Contains(t, deploymentsUpdated, "d1")
@@ -226,7 +228,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 			// d2 from before should also not be updated
 			d3, // should be updated
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(context.TODO(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 1)
 		assert.Len(t, failures, 0)
 		assert.Contains(t, deploymentsUpdated, "d3")
@@ -243,7 +245,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 			modifiedDeployment("d3", newInt32(30)),
 			modifiedDeployment("d4", newInt32(30)),
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(context.TODO(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 2)
 		assert.Len(t, failures, 2)
 		assert.Contains(t, deploymentsUpdated, "d1")
@@ -274,8 +276,10 @@ func TestWaitForDeploymentsToUpdate(t *testing.T) {
 		}
 		return appsv1.DeploymentStatus{
 			ObservedGeneration: int64(timesCalled),
-			UpdatedReplicas:    int32(timesCalled),
-			ReadyReplicas:      int32(timesCalled),
+			// nolint:gosec // G115 No overflow: widening cast.
+			UpdatedReplicas: int32(timesCalled),
+			// nolint:gosec // G115 No overflow: widening cast.
+			ReadyReplicas: int32(timesCalled),
 			Conditions: []appsv1.DeploymentCondition{
 				{Type: appsv1.DeploymentProgressing, Reason: "DoinStuff"},
 			},

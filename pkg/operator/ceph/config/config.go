@@ -101,9 +101,10 @@ func NewFlag(key, value string) string {
 	return fmt.Sprintf("--%s=%s", f, value)
 }
 
-// SetDefaultConfigs sets Rook's desired default configs in the centralized monitor database. This
+// SetOrRemoveDefaultConfigs sets Rook's desired default configs in the centralized monitor database. This
 // cannot be called before at least one monitor is established.
-func SetDefaultConfigs(
+// Also, legacy options will be removed
+func SetOrRemoveDefaultConfigs(
 	context *clusterd.Context,
 	clusterInfo *cephclient.ClusterInfo,
 	clusterSpec cephv1.ClusterSpec,
@@ -112,50 +113,44 @@ func SetDefaultConfigs(
 	// or they are specified on the commandline when daemons are called.
 	monStore := GetMonStore(context, clusterInfo)
 
-	if err := monStore.SetAll(DefaultCentralizedConfigs(clusterInfo.CephVersion)...); err != nil {
+	if err := monStore.SetAll("global", DefaultCentralizedConfigs(clusterInfo.CephVersion)); err != nil {
 		return errors.Wrapf(err, "failed to apply default Ceph configurations")
 	}
 
 	// When enabled the collector will logrotate logs from files
 	if clusterSpec.LogCollector.Enabled {
 		// Override "log file" for existing clusters since it is empty
-		logOptions := []Option{
-			configOverride("global", "log file", "/var/log/ceph/$cluster-$name.log"),
-			configOverride("global", "log to file", "true"),
+		logOptions := map[string]string{
+			"log to file": "true",
 		}
-
-		if err := monStore.SetAll(logOptions...); err != nil {
+		if err := monStore.SetAll("global", logOptions); err != nil {
 			return errors.Wrapf(err, "failed to apply logging configuration for log collector")
 		}
 		// If the log collector is disabled we do not log to file since we collect nothing
 	} else {
-		logOptions := []Option{
-			configOverride("global", "log file", ""),
-			configOverride("global", "log to file", "false"),
+		logOptions := map[string]string{
+			"log to file": "false",
 		}
-
-		if err := monStore.SetAll(logOptions...); err != nil {
+		if err := monStore.SetAll("global", logOptions); err != nil {
 			return errors.Wrapf(err, "failed to apply logging configuration")
 		}
 	}
 
-	if err := monStore.SetAll(DefaultLegacyConfigs()...); err != nil {
-		return errors.Wrapf(err, "failed to apply legacy config overrides")
-	}
-
-	// Apply Multus if needed
-	if clusterSpec.Network.IsMultus() {
-		logger.Info("configuring ceph network(s) with multus")
-		cephNetworks, err := generateNetworkSettings(context, clusterInfo.Namespace, clusterSpec.Network.Selectors)
-		if err != nil {
-			return errors.Wrap(err, "failed to generate network settings")
-		}
-
-		// Apply ceph network settings to the mon config store
-		if err := monStore.SetAll(cephNetworks...); err != nil {
-			return errors.Wrap(err, "failed to network config overrides")
-		}
+	// This section will remove any previously configured option(s) from the mon centralized store
+	// This is useful for scenarios where options are not needed anymore and we just want to reset to internal's default
+	// On upgrade, the flag will be removed
+	if err := monStore.DeleteAll(LegacyConfigs()...); err != nil {
+		return errors.Wrap(err, "failed to remove legacy options")
 	}
 
 	return nil
+}
+
+func DisableInsecureGlobalID(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo) {
+	monStore := GetMonStore(context, clusterInfo)
+	if err := monStore.Set("mon", "auth_allow_insecure_global_id_reclaim", "false"); err != nil {
+		logger.Warningf("failed to disable the insecure global ID. %v", err)
+	} else {
+		logger.Info("insecure global ID is now disabled")
+	}
 }

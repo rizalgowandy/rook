@@ -17,8 +17,8 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 
@@ -30,10 +30,10 @@ func CreateConfigDir(configDir string) error {
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return errors.Wrap(err, "error while creating directory")
 	}
-	if err := ioutil.WriteFile(path.Join(configDir, "client.admin.keyring"), []byte("key = adminsecret"), 0600); err != nil {
+	if err := os.WriteFile(path.Join(configDir, "client.admin.keyring"), []byte("key = adminsecret"), 0600); err != nil {
 		return errors.Wrap(err, "admin writefile error")
 	}
-	if err := ioutil.WriteFile(path.Join(configDir, "mon.keyring"), []byte("key = monsecret"), 0600); err != nil {
+	if err := os.WriteFile(path.Join(configDir, "mon.keyring"), []byte("key = monsecret"), 0600); err != nil {
 		return errors.Wrap(err, "mon writefile error")
 	}
 	return nil
@@ -53,14 +53,16 @@ func CreateTestClusterInfo(monCount int) *client.ClusterInfo {
 		},
 		Monitors:  map[string]*client.MonInfo{},
 		OwnerInfo: ownerInfo,
+		Context:   context.TODO(),
 	}
 	mons := []string{"a", "b", "c", "d", "e"}
 	for i := 0; i < monCount; i++ {
 		id := mons[i]
 		c.Monitors[id] = &client.MonInfo{
 			Name:     id,
-			Endpoint: fmt.Sprintf("1.2.3.%d:6789", (i + 1)),
+			Endpoint: fmt.Sprintf("1.2.3.%d:3300", (i + 1)),
 		}
 	}
+	c.SetName(c.Namespace)
 	return c
 }

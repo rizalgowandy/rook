@@ -13,14 +13,14 @@
 # limitations under the License.
 
 # the helm charts to build
-HELM_CHARTS ?= rook-ceph
+HELM_CHARTS ?= rook-ceph rook-ceph-cluster
 HELM_BASE_URL ?= https://charts.rook.io
 HELM_S3_BUCKET ?= rook.chart
-HELM_CHARTS_DIR ?= $(ROOT_DIR)/cluster/charts
+HELM_CHARTS_DIR ?= $(ROOT_DIR)/deploy/charts
 HELM_OUTPUT_DIR ?= $(OUTPUT_DIR)/charts
 
 HELM_HOME := $(abspath $(CACHE_DIR)/helm)
-HELM_VERSION := v3.4.0
+HELM_VERSION := v3.6.2
 HELM := $(TOOLS_HOST_DIR)/helm-$(HELM_VERSION)
 HELM_INDEX := $(HELM_OUTPUT_DIR)/index.yaml
 export HELM_HOME
@@ -31,17 +31,18 @@ $(HELM_OUTPUT_DIR):
 $(HELM):
 	@echo === installing helm
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@curl -sL https://get.helm.sh/helm-$(HELM_VERSION)-$(GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
-	@mv $(TOOLS_HOST_DIR)/tmp/$(GOHOSTOS)-$(GOHOSTARCH)/helm $(HELM)
+	@curl -sL https://get.helm.sh/helm-$(HELM_VERSION)-$(shell go env GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@mv $(TOOLS_HOST_DIR)/tmp/$(shell go env GOHOSTOS)-$(GOHOSTARCH)/helm $(HELM)
 	@rm -fr $(TOOLS_HOST_DIR)/tmp
 
 define helm.chart
 $(HELM_OUTPUT_DIR)/$(1)-$(VERSION).tgz: $(HELM) $(HELM_OUTPUT_DIR) $(shell find $(HELM_CHARTS_DIR)/$(1) -type f)
 	@echo === helm package $(1)
-	@cp -r $(HELM_CHARTS_DIR)/$(1) $(OUTPUT_DIR)
-	@$(SED_CMD) 's|VERSION|$(VERSION)|g' $(OUTPUT_DIR)/$(1)/values.yaml
+	@rm -rf $(OUTPUT_DIR)/$(1)
+	@cp -aL $(HELM_CHARTS_DIR)/$(1) $(OUTPUT_DIR)
+	@$(SED_IN_PLACE) 's|master|$(VERSION)|g' $(OUTPUT_DIR)/$(1)/values.yaml
 	@$(HELM) lint $(abspath $(OUTPUT_DIR)/$(1)) --set image.tag=$(VERSION)
-	@$(HELM) package --version $(VERSION) -d $(HELM_OUTPUT_DIR) $(abspath $(OUTPUT_DIR)/$(1))
+	@$(HELM) package --version $(VERSION) --app-version $(VERSION) -d $(HELM_OUTPUT_DIR) $(abspath $(OUTPUT_DIR)/$(1))
 $(HELM_INDEX): $(HELM_OUTPUT_DIR)/$(1)-$(VERSION).tgz
 endef
 $(foreach p,$(HELM_CHARTS),$(eval $(call helm.chart,$(p))))
@@ -51,3 +52,18 @@ $(HELM_INDEX): $(HELM) $(HELM_OUTPUT_DIR)
 	@$(HELM) repo index $(HELM_OUTPUT_DIR)
 
 helm.build: $(HELM_INDEX)
+
+# ====================================================================================
+# Makefile helper functions for helm-docs: https://github.com/norwoodj/helm-docs
+#
+
+HELM_DOCS_VERSION := v1.11.0
+HELM_DOCS := $(TOOLS_HOST_DIR)/helm-docs-$(HELM_DOCS_VERSION)
+HELM_DOCS_REPO := github.com/norwoodj/helm-docs/cmd/helm-docs
+
+$(HELM_DOCS): ## Installs helm-docs
+	@echo === installing helm-docs
+	@mkdir -p $(TOOLS_HOST_DIR)/tmp
+	@GOBIN=$(TOOLS_HOST_DIR)/tmp GO111MODULE=on go install $(HELM_DOCS_REPO)@$(HELM_DOCS_VERSION)
+	@mv $(TOOLS_HOST_DIR)/tmp/helm-docs $(HELM_DOCS)
+	@rm -fr $(TOOLS_HOST_DIR)/tmp

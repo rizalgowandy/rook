@@ -19,10 +19,12 @@ package sys
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	osexec "os/exec"
-	"path"
 	"strconv"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/google/uuid"
 	"github.com/rook/rook/pkg/util/exec"
@@ -43,7 +45,9 @@ const (
 	MultiPath = "mpath"
 	// LinearType is a linear type
 	LinearType = "linear"
-	sgdiskCmd  = "sgdisk"
+	// LoopType is a loop device type
+	LoopType  = "loop"
+	sgdiskCmd = "sgdisk"
 	// CephLVPrefix is the prefix of a LV owned by ceph-volume
 	CephLVPrefix = "ceph--"
 	// DeviceMapperPrefix is the prefix of a LV from the device mapper interface
@@ -90,12 +94,14 @@ type LocalDisk struct {
 	Type string `json:"type"`
 	// Rotational is the boolean whether the device is rotational: true for hdd, false for ssd and nvme
 	Rotational bool `json:"rotational"`
-	// ReadOnly is the boolean whether the device is readonly
+	// Readonly is the boolean whether the device is readonly
 	Readonly bool `json:"readOnly"`
 	// Partitions is a partition slice
 	Partitions []Partition
 	// Filesystem is the filesystem currently on the device
 	Filesystem string `json:"filesystem"`
+	// Mountpoint is the mountpoint of the filesystem's on the device
+	Mountpoint string `json:"mountpoint"`
 	// Vendor is the device vendor
 	Vendor string `json:"vendor"`
 	// Model is the device model
@@ -207,22 +213,12 @@ func GetDeviceProperties(device string, executor exec.Executor) (map[string]stri
 // GetDevicePropertiesFromPath gets a device property from a path
 func GetDevicePropertiesFromPath(devicePath string, executor exec.Executor) (map[string]string, error) {
 	output, err := executor.ExecuteCommandWithOutput("lsblk", devicePath,
-		"--bytes", "--nodeps", "--pairs", "--paths", "--output", "SIZE,ROTA,RO,TYPE,PKNAME,NAME,KNAME")
+		"--bytes", "--nodeps", "--pairs", "--paths", "--output", "SIZE,ROTA,RO,TYPE,PKNAME,NAME,KNAME,MOUNTPOINT,FSTYPE")
 	if err != nil {
-		// The "not a block device" error also returns code 32 so the ExitStatus() check hides this error
-		if strings.Contains(output, "not a block device") {
-			return nil, err
-		}
-
-		// try to get more information about the command error
-		if code, ok := exec.ExitStatus(err); ok && code == 32 {
-			// certain device types (such as loop) return exit status 32 when probed further,
-			// ignore and continue without logging
-			return map[string]string{}, nil
-		}
-
+		logger.Errorf("failed to execute lsblk. output: %s", output)
 		return nil, err
 	}
+	logger.Debugf("lsblk output: %q", output)
 
 	return parseKeyValuePairString(output), nil
 }
@@ -246,6 +242,7 @@ func GetUdevInfo(device string, executor exec.Executor) (map[string]string, erro
 	if err != nil {
 		return nil, err
 	}
+	logger.Debugf("udevadm info output: %q", output)
 
 	return parseUdevInfo(output), nil
 }
@@ -267,8 +264,7 @@ func GetDeviceFilesystems(device string, executor exec.Executor) (string, error)
 // GetDiskUUID look up the UUID for a disk.
 func GetDiskUUID(device string, executor exec.Executor) (string, error) {
 	if _, err := osexec.LookPath(sgdiskCmd); err != nil {
-		logger.Warningf("sgdisk not found. skipping disk UUID.")
-		return "sgdiskNotFound", nil
+		return "", errors.Wrap(err, "sgdisk not found")
 	}
 
 	devicePath := strings.Split(device, "/")
@@ -278,10 +274,29 @@ func GetDiskUUID(device string, executor exec.Executor) (string, error) {
 
 	output, err := executor.ExecuteCommandWithOutput(sgdiskCmd, "--print", device)
 	if err != nil {
-		return "", err
+		return "", errors.Wrapf(err, "sgdisk failed. output=%s", output)
 	}
 
 	return parseUUID(device, output)
+}
+
+func GetDiskDeviceType(disk *LocalDisk) string {
+	if disk.Rotational {
+		return "hdd"
+	}
+	if strings.Contains(disk.RealPath, "nvme") {
+		return "nvme"
+	}
+	return "ssd"
+}
+
+func GetDiskDeviceClass(crushDeviceClassVarName, deviceType string) string {
+	crushDeviceClass := os.Getenv(crushDeviceClassVarName)
+	if crushDeviceClass != "" {
+		return crushDeviceClass
+	} else {
+		return deviceType
+	}
 }
 
 // CheckIfDeviceAvailable checks if a device is available for consumption. The caller
@@ -294,9 +309,6 @@ func CheckIfDeviceAvailable(executor exec.Executor, devicePath string, pvcBacked
 		return false, "", fmt.Errorf("failed to determine if the device was LV. %v", err)
 	}
 	if isLV {
-		if !pvcBacked {
-			return false, "LV is not supported for non-PVC backed device", nil
-		}
 		checker = isLVAvailable
 	}
 
@@ -331,6 +343,11 @@ func parseUUID(device, output string) (string, error) {
 	// find the line with the uuid
 	lines := strings.Split(output, "\n")
 	for _, line := range lines {
+		// If GPT is not found in a disk, sgdisk creates a new GPT in memory and reports its UUID.
+		// This ID changes each call and is not appropriate to identify the device.
+		if strings.Contains(line, "Creating new GPT entries in memory.") {
+			break
+		}
 		if strings.Contains(line, "Disk identifier (GUID)") {
 			words := strings.Split(line, " ")
 			for _, word := range words {
@@ -408,13 +425,13 @@ func inventoryDevice(executor exec.Executor, devicePath string) (CephVolumeInven
 	args := []string{"inventory", "--format", "json", devicePath}
 	inventory, err := executor.ExecuteCommandWithOutput("ceph-volume", args...)
 	if err != nil {
-		return CVInventory, fmt.Errorf("failed to execute ceph-volume inventory on disk %q. %v", devicePath, err)
+		return CVInventory, fmt.Errorf("failed to execute ceph-volume inventory on disk %q. %s. %v", devicePath, inventory, err)
 	}
 
 	bInventory := []byte(inventory)
 	err = json.Unmarshal(bInventory, &CVInventory)
 	if err != nil {
-		return CVInventory, fmt.Errorf("error unmarshalling json data coming from ceph-volume inventory %q. %v", devicePath, err)
+		return CVInventory, fmt.Errorf("failed to unmarshal json data coming from ceph-volume inventory %q. %q. %v", devicePath, inventory, err)
 	}
 
 	return CVInventory, nil
@@ -454,11 +471,25 @@ func lvmList(executor exec.Executor, lv string) (CephVolumeLVMList, error) {
 }
 
 // ListDevicesChild list all child available on a device
+// For an encrypted device, it will return the encrypted device like so:
+// lsblk --noheadings --output NAME --path --list /dev/sdd
+// /dev/sdd
+// /dev/mapper/ocs-deviceset-thin-1-data-0hmfgp-block-dmcrypt
 func ListDevicesChild(executor exec.Executor, device string) ([]string, error) {
-	childListRaw, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--pairs", path.Join("/dev", device))
+	childListRaw, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--path", "--list", "--output", "NAME", device)
 	if err != nil {
 		return []string{}, fmt.Errorf("failed to list child devices of %q. %v", device, err)
 	}
 
 	return strings.Split(childListRaw, "\n"), nil
+}
+
+// IsDeviceEncrypted returns whether the disk has a "crypt" label on it
+func IsDeviceEncrypted(executor exec.Executor, device string) (bool, error) {
+	deviceType, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--output", "TYPE", device)
+	if err != nil {
+		return false, fmt.Errorf("failed to get devices type of %q. %v", device, err)
+	}
+
+	return deviceType == "crypt", nil
 }

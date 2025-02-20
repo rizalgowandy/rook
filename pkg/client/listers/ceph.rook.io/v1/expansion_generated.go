@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,6 +25,38 @@ type CephBlockPoolListerExpansion interface{}
 // CephBlockPoolNamespaceListerExpansion allows custom methods to be added to
 // CephBlockPoolNamespaceLister.
 type CephBlockPoolNamespaceListerExpansion interface{}
+
+// CephBlockPoolRadosNamespaceListerExpansion allows custom methods to be added to
+// CephBlockPoolRadosNamespaceLister.
+type CephBlockPoolRadosNamespaceListerExpansion interface{}
+
+// CephBlockPoolRadosNamespaceNamespaceListerExpansion allows custom methods to be added to
+// CephBlockPoolRadosNamespaceNamespaceLister.
+type CephBlockPoolRadosNamespaceNamespaceListerExpansion interface{}
+
+// CephBucketNotificationListerExpansion allows custom methods to be added to
+// CephBucketNotificationLister.
+type CephBucketNotificationListerExpansion interface{}
+
+// CephBucketNotificationNamespaceListerExpansion allows custom methods to be added to
+// CephBucketNotificationNamespaceLister.
+type CephBucketNotificationNamespaceListerExpansion interface{}
+
+// CephBucketTopicListerExpansion allows custom methods to be added to
+// CephBucketTopicLister.
+type CephBucketTopicListerExpansion interface{}
+
+// CephBucketTopicNamespaceListerExpansion allows custom methods to be added to
+// CephBucketTopicNamespaceLister.
+type CephBucketTopicNamespaceListerExpansion interface{}
+
+// CephCOSIDriverListerExpansion allows custom methods to be added to
+// CephCOSIDriverLister.
+type CephCOSIDriverListerExpansion interface{}
+
+// CephCOSIDriverNamespaceListerExpansion allows custom methods to be added to
+// CephCOSIDriverNamespaceLister.
+type CephCOSIDriverNamespaceListerExpansion interface{}
 
 // CephClientListerExpansion allows custom methods to be added to
 // CephClientLister.
@@ -57,6 +89,14 @@ type CephFilesystemMirrorListerExpansion interface{}
 // CephFilesystemMirrorNamespaceListerExpansion allows custom methods to be added to
 // CephFilesystemMirrorNamespaceLister.
 type CephFilesystemMirrorNamespaceListerExpansion interface{}
+
+// CephFilesystemSubVolumeGroupListerExpansion allows custom methods to be added to
+// CephFilesystemSubVolumeGroupLister.
+type CephFilesystemSubVolumeGroupListerExpansion interface{}
+
+// CephFilesystemSubVolumeGroupNamespaceListerExpansion allows custom methods to be added to
+// CephFilesystemSubVolumeGroupNamespaceLister.
+type CephFilesystemSubVolumeGroupNamespaceListerExpansion interface{}
 
 // CephNFSListerExpansion allows custom methods to be added to
 // CephNFSLister.

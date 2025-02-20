@@ -17,7 +17,6 @@ limitations under the License.
 package v1
 
 import (
-	rook "github.com/rook/rook/pkg/apis/rook.io/v1"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -28,10 +27,12 @@ const (
 	ResourcesKeyMgr = "mgr"
 	// ResourcesKeyMgrSidecar represents the name of resource in the CR for a mgr
 	ResourcesKeyMgrSidecar = "mgr-sidecar"
-	// ResourcesKeyOSD represents the name of resource in the CR for an osd
+	// ResourcesKeyOSD represents the name of a resource in the CR for all OSDs
 	ResourcesKeyOSD = "osd"
 	// ResourcesKeyPrepareOSD represents the name of resource in the CR for the osd prepare job
 	ResourcesKeyPrepareOSD = "prepareosd"
+	// ResourcesKeyCmdReporter represents the name of resource in the CR for the detect version and network jobs
+	ResourcesKeyCmdReporter = "cmd-reporter"
 	// ResourcesKeyMDS represents the name of resource in the CR for the mds
 	ResourcesKeyMDS = "mds"
 	// ResourcesKeyCrashCollector represents the name of resource in the CR for the crash
@@ -44,44 +45,69 @@ const (
 	ResourcesKeyFilesystemMirror = "fsmirror"
 	// ResourcesKeyCleanup represents the name of resource in the CR for the cleanup
 	ResourcesKeyCleanup = "cleanup"
+	// ResourcesKeyCleanup represents the name of resource in the CR for ceph-exporter
+	ResourcesKeyCephExporter = "exporter"
 )
 
-// GetMgrResources returns the placement for the MGR service
-func GetMgrResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetMgrResources returns the resources for the MGR service
+func GetMgrResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyMgr]
 }
 
-// GetMgrSidecarResources returns the placement for the MGR sidecar container
-func GetMgrSidecarResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetMgrSidecarResources returns the resources for the MGR sidecar container
+func GetMgrSidecarResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyMgrSidecar]
 }
 
-// GetMonResources returns the placement for the monitors
-func GetMonResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetMonResources returns the resources for the monitors
+func GetMonResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyMon]
 }
 
-// GetOSDResources returns the placement for the OSDs
-func GetOSDResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetOSDResources returns the resources for all OSDs or for OSDs of specified device class (hdd, nvme, ssd)
+func GetOSDResources(p ResourceSpec, deviceClass string) v1.ResourceRequirements {
+	if deviceClass == "" {
+		return p[ResourcesKeyOSD]
+	}
+	// if device class specified, but not set in requirements return common osd requirements if present
+	r, ok := p[getOSDResourceKeyForDeviceClass(deviceClass)]
+	if ok {
+		return r
+	}
 	return p[ResourcesKeyOSD]
 }
 
-// GetPrepareOSDResources returns the placement for the OSDs prepare job
-func GetPrepareOSDResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// getOSDResourceKeyForDeviceClass returns key name for device class in resources spec
+func getOSDResourceKeyForDeviceClass(deviceClass string) string {
+	return ResourcesKeyOSD + "-" + deviceClass
+}
+
+// GetPrepareOSDResources returns the resources for the OSDs prepare job
+func GetPrepareOSDResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyPrepareOSD]
 }
 
-// GetCrashCollectorResources returns the placement for the crash daemon
-func GetCrashCollectorResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetCmdReporterResources returns the resources for the detect version job
+func GetCmdReporterResources(p ResourceSpec) v1.ResourceRequirements {
+	return p[ResourcesKeyCmdReporter]
+}
+
+// GetCrashCollectorResources returns the resources for the crash daemon
+func GetCrashCollectorResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyCrashCollector]
 }
 
-// GetLogCollectorResources returns the placement for the crash daemon
-func GetLogCollectorResources(p rook.ResourceSpec) v1.ResourceRequirements {
-	return p[ResourcesKeyCrashCollector]
+// GetLogCollectorResources returns the resources for the logo collector
+func GetLogCollectorResources(p ResourceSpec) v1.ResourceRequirements {
+	return p[ResourcesKeyLogCollector]
 }
 
-// GetCleanupResources returns the placement for the cleanup job
-func GetCleanupResources(p rook.ResourceSpec) v1.ResourceRequirements {
+// GetCleanupResources returns the resources for the cleanup job
+func GetCleanupResources(p ResourceSpec) v1.ResourceRequirements {
 	return p[ResourcesKeyCleanup]
+}
+
+// GetCephExporterResources returns the resources for the cleanup job
+func GetCephExporterResources(p ResourceSpec) v1.ResourceRequirements {
+	return p[ResourcesKeyCephExporter]
 }

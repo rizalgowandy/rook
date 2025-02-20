@@ -17,7 +17,6 @@ limitations under the License.
 package osd
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -29,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // THE LIBRARY PROVIDED BY THIS FILE IS NOT THREAD SAFE
@@ -43,17 +43,20 @@ var (
 )
 
 type updateConfig struct {
-	cluster          *Cluster
-	provisionConfig  *provisionConfig
-	queue            *updateQueue   // these OSDs need updated
-	numUpdatesNeeded int            // the number of OSDs that needed updating
-	deployments      *existenceList // these OSDs have existing deployments
+	cluster             *Cluster
+	provisionConfig     *provisionConfig
+	queue               *updateQueue     // these OSDs need updated
+	numUpdatesNeeded    int              // the number of OSDs that needed updating
+	deployments         *existenceList   // these OSDs have existing deployments
+	osdsToSkipReconcile sets.Set[string] // these OSDs should not be updated during reconcile
+	osdDesiredState     map[int]*OSDInfo // the desired state of the OSDs determined during the reconcile
 }
 
 func (c *Cluster) newUpdateConfig(
 	provisionConfig *provisionConfig,
 	queue *updateQueue,
 	deployments *existenceList,
+	osdsToSkipReconcile sets.Set[string],
 ) *updateConfig {
 	return &updateConfig{
 		c,
@@ -61,6 +64,8 @@ func (c *Cluster) newUpdateConfig(
 		queue,
 		queue.Len(),
 		deployments,
+		osdsToSkipReconcile,
+		map[int]*OSDInfo{},
 	}
 }
 
@@ -73,18 +78,30 @@ func (c *updateConfig) doneUpdating() bool {
 }
 
 func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
-	ctx := context.TODO()
-
 	if c.doneUpdating() {
 		return // no more OSDs to update
 	}
+	if !c.cluster.spec.SkipUpgradeChecks && c.cluster.spec.UpgradeOSDRequiresHealthyPGs {
+		pgHealthMsg, pgClean, err := cephclient.IsClusterClean(c.cluster.context, c.cluster.clusterInfo, c.cluster.spec.DisruptionManagement.PGHealthyRegex)
+		if err != nil {
+			logger.Warningf("failed to check PGs status to update OSDs, will try updating it again later. %v", err)
+			return
+		}
+		if !pgClean {
+			logger.Infof("PGs are not healthy to update OSDs, will try updating it again later. PGs status: %q", pgHealthMsg)
+			return
+		}
+		logger.Infof("PGs are healthy to proceed updating OSDs. %v", pgHealthMsg)
+	}
+
 	osdIDQuery, _ := c.queue.Pop()
 
 	var osdIDs []int
 	var err error
-	if !shouldCheckOkToStopFunc(c.cluster.context, c.cluster.clusterInfo) {
+	if c.cluster.spec.SkipUpgradeChecks || !shouldCheckOkToStopFunc(c.cluster.context, c.cluster.clusterInfo) {
 		// If we should not check ok-to-stop, then only process one OSD at a time. There are likely
 		// less than 3 OSDs in the cluster or the cluster is on a single node. E.g., in CI :wink:.
+		logger.Infof("skipping osd checks for ok-to-stop")
 		osdIDs = []int{osdIDQuery}
 	} else {
 		osdIDs, err = cephclient.OSDOkToStop(c.cluster.context, c.cluster.clusterInfo, osdIDQuery, maxUpdatesInParallel)
@@ -117,7 +134,7 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 		}
 
 		depName := deploymentName(osdID)
-		dep, err := c.cluster.context.Clientset.AppsV1().Deployments(c.cluster.clusterInfo.Namespace).Get(ctx, depName, metav1.GetOptions{})
+		dep, err := c.cluster.context.Clientset.AppsV1().Deployments(c.cluster.clusterInfo.Namespace).Get(c.cluster.clusterInfo.Context, depName, metav1.GetOptions{})
 		if err != nil {
 			errs.addError("failed to update OSD %d. failed to find existing deployment %q. %v", osdID, depName, err)
 			continue
@@ -127,6 +144,24 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 			errs.addError("failed to update OSD %d. failed to extract OSD info from existing deployment %q. %v", osdID, depName, err)
 			continue
 		}
+		c.osdDesiredState[osdID] = &osdInfo
+
+		if c.osdsToSkipReconcile.Has(strconv.Itoa(osdID)) {
+			logger.Warningf("Skipping update for OSD %d since labeled with %s", osdID, cephv1.SkipReconcileLabelKey)
+			continue
+		}
+
+		// backward compatibility for old deployments
+		// Checking DeviceClass with None too, because ceph-volume lvm list return crush device class as None
+		// Tracker https://tracker.ceph.com/issues/53425
+		if osdInfo.DeviceClass == "" || osdInfo.DeviceClass == "None" {
+			deviceClassInfo, err := cephclient.OSDDeviceClasses(c.cluster.context, c.cluster.clusterInfo, []string{strconv.Itoa(osdID)})
+			if err != nil {
+				logger.Errorf("failed to get device class for existing deployment %q. %v", depName, err)
+			} else {
+				osdInfo.DeviceClass = deviceClassInfo[0].DeviceClass
+			}
+		}
 
 		nodeOrPVCName, err := getNodeOrPVCName(dep)
 		if err != nil {
@@ -135,16 +170,19 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 		}
 
 		var updatedDep *appsv1.Deployment
+
+		if c.cluster.spec.Network.MultiClusterService.Enabled {
+			osdInfo.ExportService = true
+		}
+
 		if osdIsOnPVC(dep) {
 			logger.Infof("updating OSD %d on PVC %q", osdID, nodeOrPVCName)
-			updatedDep, err = deploymentOnPVCFunc(c.cluster, osdInfo, nodeOrPVCName, c.provisionConfig)
-
+			updatedDep, err = deploymentOnPVCFunc(c.cluster, &osdInfo, nodeOrPVCName, c.provisionConfig)
 			message := fmt.Sprintf("Processing OSD %d on PVC %q", osdID, nodeOrPVCName)
-			updateConditionFunc(c.cluster.context, c.cluster.clusterInfo.NamespacedName(), cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
+			updateConditionFunc(c.cluster.clusterInfo.Context, c.cluster.context, c.cluster.clusterInfo.NamespacedName(), k8sutil.ObservedGenerationNotAvailable, cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
 		} else {
 			if !c.cluster.ValidStorage.NodeExists(nodeOrPVCName) {
 				// node will not reconcile, so don't update the deployment
-				// allow the OSD health checker to remove the OSD
 				logger.Warningf(
 					"not updating OSD %d on node %q. node no longer exists in the storage spec. "+
 						"if the user wishes to remove OSDs from the node, they must do so manually. "+
@@ -154,10 +192,9 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 			}
 
 			logger.Infof("updating OSD %d on node %q", osdID, nodeOrPVCName)
-			updatedDep, err = deploymentOnNodeFunc(c.cluster, osdInfo, nodeOrPVCName, c.provisionConfig)
-
+			updatedDep, err = deploymentOnNodeFunc(c.cluster, &osdInfo, nodeOrPVCName, c.provisionConfig)
 			message := fmt.Sprintf("Processing OSD %d on node %q", osdID, nodeOrPVCName)
-			updateConditionFunc(c.cluster.context, c.cluster.clusterInfo.NamespacedName(), cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
+			updateConditionFunc(c.cluster.clusterInfo.Context, c.cluster.context, c.cluster.clusterInfo.NamespacedName(), k8sutil.ObservedGenerationNotAvailable, cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
 		}
 		if err != nil {
 			errs.addError("%v", errors.Wrapf(err, "failed to update OSD %d", osdID))
@@ -171,7 +208,7 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 	// when waiting on deployments to be updated, only list OSDs we intend to update specifically by ID
 	listFunc := c.cluster.getFuncToListDeploymentsWithIDs(listIDs)
 
-	failures := updateMultipleDeploymentsAndWaitFunc(c.cluster.context.Clientset, updatedDeployments, listFunc)
+	failures := updateMultipleDeploymentsAndWaitFunc(c.cluster.clusterInfo.Context, c.cluster.context.Clientset, updatedDeployments, listFunc)
 	for _, f := range failures {
 		errs.addError("%v", errors.Wrapf(f.Error, "failed to update OSD deployment %q", f.ResourceName))
 	}
@@ -184,7 +221,6 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 // getOSDUpdateInfo returns an update queue of OSDs which need updated and an existence list of OSD
 // Deployments which already exist.
 func (c *Cluster) getOSDUpdateInfo(errs *provisionErrors) (*updateQueue, *existenceList, error) {
-	ctx := context.TODO()
 	namespace := c.clusterInfo.Namespace
 
 	selector := fmt.Sprintf("%s=%s", k8sutil.AppAttr, AppName)
@@ -192,14 +228,13 @@ func (c *Cluster) getOSDUpdateInfo(errs *provisionErrors) (*updateQueue, *existe
 		// list only rook-ceph-osd Deployments
 		LabelSelector: selector,
 	}
-	deps, err := c.context.Clientset.AppsV1().Deployments(namespace).List(ctx, listOpts)
+	deps, err := c.context.Clientset.AppsV1().Deployments(namespace).List(c.clusterInfo.Context, listOpts)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "failed to query existing OSD deployments to see if they need updated")
 	}
 
 	updateQueue := newUpdateQueueWithCapacity(len(deps.Items))
 	existenceList := newExistenceListWithCapacity(len(deps.Items))
-
 	for i := range deps.Items {
 		id, err := getOSDID(&deps.Items[i]) // avoid implicit memory aliasing by indexing
 		if err != nil {
@@ -207,7 +242,6 @@ func (c *Cluster) getOSDUpdateInfo(errs *provisionErrors) (*updateQueue, *existe
 			errs.addError("%v. did a user create their own deployment with label %q?", selector, err)
 			continue
 		}
-
 		// all OSD deployments should be marked as existing
 		existenceList.Add(id)
 		updateQueue.Push(id)
@@ -264,6 +298,11 @@ func (q *updateQueue) Exists(osdID int) bool {
 		}
 	}
 	return false
+}
+
+// Clear deletes all entries inside the queue
+func (q *updateQueue) Clear() {
+	q.q = q.q[:0]
 }
 
 // Remove removes the items from the queue if they exist.
@@ -328,12 +367,26 @@ func (e *existenceList) Exists(osdID int) bool {
 
 // return a function that will list only OSD deployments with the IDs given
 func (c *Cluster) getFuncToListDeploymentsWithIDs(osdIDs []string) func() (*appsv1.DeploymentList, error) {
-	ctx := context.TODO()
 	selector := fmt.Sprintf("ceph-osd-id in (%s)", strings.Join(osdIDs, ", "))
 	listOpts := metav1.ListOptions{
 		LabelSelector: selector, // e.g. 'ceph-osd-id in (1, 3, 5, 7, 9)'
 	}
 	return func() (*appsv1.DeploymentList, error) {
-		return c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).List(ctx, listOpts)
+		return c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).List(c.clusterInfo.Context, listOpts)
 	}
+}
+
+// getOSDDeployments returns the list of existing OSD deployments
+func (c *Cluster) getOSDDeployments() (*appsv1.DeploymentList, error) {
+	namespace := c.clusterInfo.Namespace
+	selector := fmt.Sprintf("%s=%s", k8sutil.AppAttr, AppName)
+	listOpts := metav1.ListOptions{
+		// list only rook-ceph-osd Deployments
+		LabelSelector: selector,
+	}
+	deps, err := c.context.Clientset.AppsV1().Deployments(namespace).List(c.clusterInfo.Context, listOpts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to query existing OSD deployments to check if they need to be updated")
+	}
+	return deps, nil
 }

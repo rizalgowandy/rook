@@ -17,11 +17,9 @@ limitations under the License.
 package mon
 
 import (
-	"context"
-
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -44,7 +42,7 @@ func (c *Cluster) reconcileMonPDB() error {
 		return nil
 	}
 
-	op, err := c.createOrUpdateMonPDB(1)
+	op, err := c.createOrUpdateMonPDB(c.getMaxUnavailableMonPodCount())
 	if err != nil {
 		return errors.Wrapf(err, "failed to reconcile mon pdb on op %q", op)
 	}
@@ -52,22 +50,24 @@ func (c *Cluster) reconcileMonPDB() error {
 }
 
 func (c *Cluster) createOrUpdateMonPDB(maxUnavailable int32) (controllerutil.OperationResult, error) {
-	pdb := &policyv1beta1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      monPDBName,
-			Namespace: c.Namespace,
-		}}
+	objectMeta := metav1.ObjectMeta{
+		Name:      monPDBName,
+		Namespace: c.Namespace,
+	}
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{k8sutil.AppAttr: AppName},
+	}
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: objectMeta}
 
 	mutateFunc := func() error {
-		pdb.Spec = policyv1beta1.PodDisruptionBudgetSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{k8sutil.AppAttr: AppName},
-			},
+		pdb.Spec = policyv1.PodDisruptionBudgetSpec{
+			Selector:       selector,
 			MaxUnavailable: &intstr.IntOrString{IntVal: maxUnavailable},
 		}
 		return nil
 	}
-	return controllerutil.CreateOrUpdate(context.TODO(), c.context.Client, pdb, mutateFunc)
+	return controllerutil.CreateOrUpdate(c.ClusterInfo.Context, c.context.Client, pdb, mutateFunc)
 }
 
 // blockMonDrain makes MaxUnavailable in mon PDB to 0 to block any voluntary mon drains
@@ -90,10 +90,18 @@ func (c *Cluster) allowMonDrain(request types.NamespacedName) error {
 		return nil
 	}
 	logger.Info("allow voluntary mon drain after failover")
-	// change MaxUnavailable mon PDB to 1
-	_, err := c.createOrUpdateMonPDB(1)
+	_, err := c.createOrUpdateMonPDB(c.getMaxUnavailableMonPodCount())
 	if err != nil {
 		return errors.Wrapf(err, "failed to update MaxUnavailable for mon PDB %q", request.Name)
 	}
 	return nil
+}
+
+func (c *Cluster) getMaxUnavailableMonPodCount() int32 {
+	if c.spec.Mon.Count >= 5 {
+		logger.Debug("setting the mon pdb max unavailable count to 2 in case there are 5 or more mons")
+		return 2
+	}
+
+	return 1
 }

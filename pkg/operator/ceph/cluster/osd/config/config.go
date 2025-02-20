@@ -18,18 +18,21 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
 	"strconv"
+
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 )
 
 const (
 	WalSizeMBKey       = "walSizeMB"
 	DatabaseSizeMBKey  = "databaseSizeMB"
-	JournalSizeMBKey   = "journalSizeMB"
 	OSDsPerDeviceKey   = "osdsPerDevice"
 	EncryptedDeviceKey = "encryptedDevice"
 	MetadataDeviceKey  = "metadataDevice"
 	DeviceClassKey     = "deviceClass"
 	InitialWeightKey   = "initialWeight"
+	PrimaryAffinityKey = "primaryAffinity"
 )
 
 // StoreConfig represents the configuration of an OSD on a device.
@@ -41,6 +44,20 @@ type StoreConfig struct {
 	MetadataDevice  string `json:"metadataDevice,omitempty"`
 	DeviceClass     string `json:"deviceClass,omitempty"`
 	InitialWeight   string `json:"initialWeight,omitempty"`
+	PrimaryAffinity string `json:"primaryAffinity,omitempty"`
+	StoreType       string `json:"storeType,omitempty"`
+}
+
+func (s StoreConfig) IsValidStoreType() bool {
+	if s.StoreType == string(cephv1.StoreTypeBlueStore) || s.StoreType == string(cephv1.StoreTypeBlueStoreRDR) {
+		return true
+	}
+
+	return false
+}
+
+func (s StoreConfig) GetStoreFlag() string {
+	return fmt.Sprintf("--%s", s.StoreType)
 }
 
 // NewStoreConfig returns a StoreConfig with proper defaults set.
@@ -72,6 +89,8 @@ func ToStoreConfig(config map[string]string) StoreConfig {
 			storeConfig.DeviceClass = v
 		case InitialWeightKey:
 			storeConfig.InitialWeight = v
+		case PrimaryAffinityKey:
+			storeConfig.PrimaryAffinity = v
 		}
 	}
 

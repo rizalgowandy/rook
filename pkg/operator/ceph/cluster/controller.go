@@ -19,27 +19,31 @@ package cluster
 
 import (
 	"context"
-	"os"
-	"sync"
-	"time"
+	"fmt"
 
+	csiopv1a1 "github.com/ceph/ceph-csi-operator/api/v1alpha1"
 	"github.com/coreos/pkg/capnslog"
+	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/api/csiaddons/v1alpha1"
+
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/agent/flexvolume/attachment"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/daemon/ceph/osd/kms"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/csi"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/labels"
+	apituntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -49,8 +53,7 @@ import (
 )
 
 const (
-	controllerName           = "ceph-cluster-controller"
-	detectCephVersionTimeout = 15 * time.Minute
+	controllerName = "ceph-cluster-controller"
 )
 
 const (
@@ -81,49 +84,50 @@ var ControllerTypeMeta = metav1.TypeMeta{
 
 // ClusterController controls an instance of a Rook cluster
 type ClusterController struct {
-	context                 *clusterd.Context
-	volumeAttachment        attachment.Attachment
-	rookImage               string
-	clusterMap              map[string]*cluster
-	operatorConfigCallbacks []func() error
-	addClusterCallbacks     []func() error
-	csiConfigMutex          *sync.Mutex
-	osdChecker              *osd.OSDHealthMonitor
-	client                  client.Client
-	namespacedName          types.NamespacedName
+	context        *clusterd.Context
+	rookImage      string
+	clusterMap     map[string]*cluster
+	osdChecker     *osd.OSDHealthMonitor
+	client         client.Client
+	namespacedName types.NamespacedName
+	recorder       record.EventRecorder
+	OpManagerCtx   context.Context
 }
 
 // ReconcileCephCluster reconciles a CephFilesystem object
 type ReconcileCephCluster struct {
 	client            client.Client
-	scheme            *runtime.Scheme
+	scheme            *apituntime.Scheme
 	context           *clusterd.Context
 	clusterController *ClusterController
+	opManagerContext  context.Context
+	opConfig          opcontroller.OperatorConfig
 }
 
 // Add creates a new CephCluster Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager, ctx *clusterd.Context, clusterController *ClusterController) error {
-	return add(mgr, newReconciler(mgr, ctx, clusterController), ctx)
+func Add(mgr manager.Manager, ctx *clusterd.Context, clusterController *ClusterController, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
+	return add(opManagerContext, mgr, newReconciler(mgr, ctx, clusterController, opManagerContext, opConfig), ctx, opConfig)
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, ctx *clusterd.Context, clusterController *ClusterController) reconcile.Reconciler {
-	// Add the cephv1 scheme to the manager scheme so that the controller knows about it
-	mgrScheme := mgr.GetScheme()
-	if err := cephv1.AddToScheme(mgr.GetScheme()); err != nil {
-		panic(err)
-	}
+func newReconciler(mgr manager.Manager, ctx *clusterd.Context, clusterController *ClusterController, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) reconcile.Reconciler {
+	// add "rook-" prefix to the controller name to make sure it is clear to all reading the events
+	// that they are coming from Rook. The controller name already has context that it is for Ceph
+	// and from the cluster controller.
+	clusterController.recorder = mgr.GetEventRecorderFor("rook-" + controllerName)
 
 	return &ReconcileCephCluster{
 		client:            mgr.GetClient(),
-		scheme:            mgrScheme,
+		scheme:            mgr.GetScheme(),
 		context:           ctx,
+		opConfig:          opConfig,
 		clusterController: clusterController,
+		opManagerContext:  opManagerContext,
 	}
 }
 
-func add(mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context) error {
+func add(opManagerContext context.Context, mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context, opConfig opcontroller.OperatorConfig) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
 	if err != nil {
@@ -131,15 +135,22 @@ func add(mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context)
 	}
 	logger.Info("successfully started")
 
+	err = addonsv1alpha1.AddToScheme(mgr.GetScheme())
+	if err != nil {
+		return err
+	}
+
+	err = csiopv1a1.AddToScheme(mgr.GetScheme())
+	if err != nil {
+		return err
+	}
+
 	// Watch for changes on the CephCluster CR object
-	err = c.Watch(
-		&source.Kind{
-			Type: &cephv1.CephCluster{
-				TypeMeta: ControllerTypeMeta,
-			},
-		},
-		&handler.EnqueueRequestForObject{},
-		watchControllerPredicate(context))
+	s := source.Kind[client.Object](
+		mgr.GetCache(), &cephv1.CephCluster{TypeMeta: ControllerTypeMeta},
+		&handler.EnqueueRequestForObject{}, watchControllerPredicate(opManagerContext, mgr.GetClient()),
+	)
+	err = c.Watch(s)
 	if err != nil {
 		return err
 	}
@@ -147,14 +158,10 @@ func add(mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context)
 	// Watch all other resources of the Ceph Cluster
 	for _, t := range objectsToWatch {
 		err = c.Watch(
-			&source.Kind{
-				Type: t,
-			},
-			&handler.EnqueueRequestForOwner{
-				IsController: true,
-				OwnerType:    &cephv1.CephCluster{},
-			},
-			opcontroller.WatchPredicateForNonCRDObject(&cephv1.CephCluster{TypeMeta: ControllerTypeMeta}, mgr.GetScheme()))
+			source.Kind[client.Object](
+				mgr.GetCache(), t, handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &cephv1.CephCluster{}),
+				opcontroller.WatchPredicateForNonCRDObject(&cephv1.CephCluster{TypeMeta: ControllerTypeMeta}, mgr.GetScheme())),
+		)
 		if err != nil {
 			return err
 		}
@@ -162,43 +169,35 @@ func add(mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context)
 
 	// Build Handler function to return the list of ceph clusters
 	// This is used by the watchers below
-	handlerFunc, err := opcontroller.ObjectToCRMapper(mgr.GetClient(), &cephv1.CephClusterList{}, mgr.GetScheme())
+	handlerFunc, err := opcontroller.ObjectToCRMapper(opManagerContext, mgr.GetClient(), &cephv1.CephClusterList{}, mgr.GetScheme())
 	if err != nil {
 		return err
 	}
 
 	// Watch for nodes additions and updates
-	err = c.Watch(
-		&source.Kind{
-			Type: &corev1.Node{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Node",
-					APIVersion: corev1.SchemeGroupVersion.String(),
-				},
-			},
-		},
+	nodeKind := source.Kind[client.Object](
+		mgr.GetCache(),
+		&corev1.Node{TypeMeta: metav1.TypeMeta{Kind: "Node", APIVersion: corev1.SchemeGroupVersion.String()}},
 		handler.EnqueueRequestsFromMapFunc(handlerFunc),
-		predicateForNodeWatcher(mgr.GetClient(), context))
+		predicateForNodeWatcher(opManagerContext, mgr.GetClient(), context, opConfig.OperatorNamespace))
+	err = c.Watch(nodeKind)
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes on the hotplug config map
 	// TODO: to improve, can we run this against the operator namespace only?
-	disableVal := os.Getenv(disableHotplugEnv)
+	disableVal, err := k8sutil.GetOperatorSetting(opManagerContext, context.Clientset, opcontroller.OperatorSettingConfigMapName, disableHotplugEnv, "false")
+	if err != nil {
+		logger.Errorf("failed to get %s setting %s. %v", disableHotplugEnv, opcontroller.OperatorSettingConfigMapName, err)
+	}
 	if disableVal != "true" {
 		logger.Info("enabling hotplug orchestration")
-		err = c.Watch(
-			&source.Kind{
-				Type: &corev1.ConfigMap{
-					TypeMeta: metav1.TypeMeta{
-						Kind:       "ConfigMap",
-						APIVersion: corev1.SchemeGroupVersion.String(),
-					},
-				},
-			},
-			handler.EnqueueRequestsFromMapFunc(handlerFunc),
-			predicateForHotPlugCMWatcher(mgr.GetClient()))
+		s := source.Kind[client.Object](
+			mgr.GetCache(),
+			&corev1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: corev1.SchemeGroupVersion.String()}},
+			handler.EnqueueRequestsFromMapFunc(handlerFunc), predicateForHotPlugCMWatcher(mgr.GetClient()))
+		err = c.Watch(s)
 		if err != nil {
 			return err
 		}
@@ -215,15 +214,13 @@ func add(mgr manager.Manager, r reconcile.Reconciler, context *clusterd.Context)
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCephCluster) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
-	reconcileResponse, err := r.reconcile(request)
-	if err != nil {
-		logger.Errorf("failed to reconcile. %v", err)
-	}
+	reconcileResponse, cephCluster, err := r.reconcile(request)
 
-	return reconcileResponse, err
+	return reporting.ReportReconcileResult(logger, r.clusterController.recorder, request,
+		&cephCluster, reconcileResponse, err)
 }
 
-func (r *ReconcileCephCluster) reconcile(request reconcile.Request) (reconcile.Result, error) {
+func (r *ReconcileCephCluster) reconcile(request reconcile.Request) (reconcile.Result, cephv1.CephCluster, error) {
 	// Pass the client context to the ClusterController
 	r.clusterController.client = r.client
 
@@ -235,93 +232,118 @@ func (r *ReconcileCephCluster) reconcile(request reconcile.Request) (reconcile.R
 
 	// Fetch the cephCluster instance
 	cephCluster := &cephv1.CephCluster{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, cephCluster)
+	err := r.client.Get(r.opManagerContext, request.NamespacedName, cephCluster)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			logger.Debug("cephCluster resource not found. Ignoring since object must be deleted.")
-			return reconcile.Result{}, nil
+			return reconcile.Result{}, *cephCluster, nil
 		}
 		// Error reading the object - requeue the request.
-		return reconcile.Result{}, errors.Wrap(err, "failed to get cephCluster")
+		return reconcile.Result{}, *cephCluster, errors.Wrap(err, "failed to get cephCluster")
 	}
 
 	// Set a finalizer so we can do cleanup before the object goes away
-	err = opcontroller.AddFinalizerIfNotPresent(r.client, cephCluster)
+	err = opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephCluster)
 	if err != nil {
-		return reconcile.Result{}, errors.Wrap(err, "failed to add finalizer")
+		return reconcile.Result{}, *cephCluster, errors.Wrap(err, "failed to add finalizer")
 	}
 
 	// DELETE: the CR was deleted
 	if !cephCluster.GetDeletionTimestamp().IsZero() {
-		doCleanup := true
-		logger.Infof("deleting ceph cluster %q", cephCluster.Name)
-
-		// Start cluster clean up only if cleanupPolicy is applied to the ceph cluster
-		stopCleanupCh := make(chan struct{})
-		if cephCluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
-			// Set the deleting status
-			updateStatus(r.client, request.NamespacedName, cephv1.ConditionDeleting)
-
-			monSecret, clusterFSID, err := r.clusterController.getCleanUpDetails(cephCluster.Namespace)
-			if err != nil {
-				logger.Warningf("failed to get mon secret. Skip cluster cleanup and remove finalizer. %v", err)
-				doCleanup = false
-			}
-
-			if doCleanup {
-				cephHosts, err := r.clusterController.getCephHosts(cephCluster.Namespace)
-				if err != nil {
-					return reconcile.Result{}, errors.Wrapf(err, "failed to find valid ceph hosts in the cluster %q", cephCluster.Namespace)
-				}
-				go r.clusterController.startClusterCleanUp(stopCleanupCh, cephCluster, cephHosts, monSecret, clusterFSID)
-			}
-		}
-
-		if doCleanup {
-			// Run delete sequence
-			response, ok := r.clusterController.requestClusterDelete(cephCluster)
-			if !ok {
-				// If the cluster cannot be deleted, requeue the request for deletion to see if the conditions
-				// will eventually be satisfied such as the volumes being removed
-				close(stopCleanupCh)
-				return response, nil
-			}
-		}
-
-		// Remove finalizer
-		err = removeFinalizer(r.client, request.NamespacedName)
-		if err != nil {
-			return reconcile.Result{}, errors.Wrap(err, "failed to remove finalizer")
-		}
-
-		// Return and do not requeue. Successful deletion.
-		return reconcile.Result{}, nil
+		return r.reconcileDelete(cephCluster)
 	}
 
 	// Do reconcile here!
 	ownerInfo := k8sutil.NewOwnerInfo(cephCluster, r.scheme)
-	if err := r.clusterController.onAdd(cephCluster, ownerInfo); err != nil {
-		return reconcile.Result{}, errors.Wrapf(err, "failed to reconcile cluster %q", cephCluster.Name)
+	if err := r.clusterController.reconcileCephCluster(cephCluster, ownerInfo); err != nil {
+		// If the error has a context cancelled let's return a success result so that the controller can
+		// exit gracefully and the goroutine (the one the manager runs in) won't block retrying even if the parent context has been
+		// cancelled.
+		// Normally this should not happen but in some circumstances if the context is cancelled we will
+		// error-loop (backoff) and the controller will never exit (even though a new one has been
+		// started). So we would get messages from the other go routine printing a message
+		// repeatedly that the context is cancelled.
+		if errors.Is(r.opManagerContext.Err(), context.Canceled) {
+			logger.Info("context cancelled, exiting reconcile")
+			return reconcile.Result{}, *cephCluster, nil
+		}
+
+		return reconcile.Result{}, *cephCluster, errors.Wrapf(err, "failed to reconcile cluster %q", cephCluster.Name)
 	}
 
 	// Return and do not requeue
-	return reconcile.Result{}, nil
+	return reconcile.Result{}, *cephCluster, nil
+}
+
+func (r *ReconcileCephCluster) reconcileDelete(cephCluster *cephv1.CephCluster) (reconcile.Result, cephv1.CephCluster, error) {
+	nsName := r.clusterController.namespacedName
+	var err error
+
+	// Set the deleting status
+	opcontroller.UpdateClusterCondition(r.context, cephCluster, nsName,
+		k8sutil.ObservedGenerationNotAvailable, cephv1.ConditionDeleting, corev1.ConditionTrue, cephv1.ClusterDeletingReason, "Deleting the CephCluster",
+		true /* keep all other conditions to be safe */)
+
+	deps, err := CephClusterDependents(r.context, cephCluster.Namespace)
+	if err != nil {
+		return reconcile.Result{}, *cephCluster, err
+	}
+	if !deps.Empty() {
+		err := reporting.ReportDeletionBlockedDueToDependents(r.opManagerContext, logger, r.client, cephCluster, deps)
+		return opcontroller.WaitForRequeueIfFinalizerBlocked, *cephCluster, err
+	}
+	reporting.ReportDeletionNotBlockedDueToDependents(r.opManagerContext, logger, r.client, r.clusterController.recorder, cephCluster)
+
+	doCleanup := true
+
+	// Start cluster clean up only if cleanupPolicy is applied to the ceph cluster
+	internalCtx := context.Context(r.opManagerContext)
+	if cephCluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() && !cephCluster.Spec.External.Enable {
+		monSecret, clusterFSID, err := r.clusterController.getCleanUpDetails(&cephCluster.Spec, cephCluster.Namespace)
+		if err != nil {
+			logger.Warningf("failed to get mon secret. skip cluster cleanup. remove finalizer. %v", err)
+			doCleanup = false
+		}
+
+		if doCleanup {
+			cephHosts, err := r.clusterController.getCephHosts(cephCluster.Namespace)
+			if err != nil {
+				return reconcile.Result{}, *cephCluster, errors.Wrapf(err, "failed to find valid ceph hosts in the cluster %q", cephCluster.Namespace)
+			}
+			go r.clusterController.startClusterCleanUp(internalCtx, cephCluster, cephHosts, monSecret, clusterFSID)
+		}
+	}
+
+	if doCleanup {
+		// Run delete sequence
+		response, err := r.clusterController.requestClusterDelete(cephCluster)
+		if err != nil {
+			// If the cluster cannot be deleted, requeue the request for deletion to see if the conditions
+			// will eventually be satisfied such as the volumes being removed
+			return response, *cephCluster, errors.Wrapf(err, "failed to clean up CephCluster %q", nsName.String())
+		}
+	}
+
+	// Remove finalizers
+	err = r.removeFinalizers(r.client, nsName)
+	if err != nil {
+		return reconcile.Result{}, *cephCluster, errors.Wrap(err, "failed to remove finalizers")
+	}
+
+	// Return and do not requeue. Successful deletion.
+	return reconcile.Result{}, *cephCluster, nil
 }
 
 // NewClusterController create controller for watching cluster custom resources created
-func NewClusterController(context *clusterd.Context, rookImage string, volumeAttachment attachment.Attachment, operatorConfigCallbacks []func() error, addClusterCallbacks []func() error) *ClusterController {
+func NewClusterController(context *clusterd.Context, rookImage string) *ClusterController {
 	return &ClusterController{
-		context:                 context,
-		volumeAttachment:        volumeAttachment,
-		rookImage:               rookImage,
-		clusterMap:              make(map[string]*cluster),
-		operatorConfigCallbacks: operatorConfigCallbacks,
-		addClusterCallbacks:     addClusterCallbacks,
-		csiConfigMutex:          &sync.Mutex{},
+		context:    context,
+		rookImage:  rookImage,
+		clusterMap: make(map[string]*cluster),
 	}
 }
 
-func (c *ClusterController) onAdd(clusterObj *cephv1.CephCluster, ownerInfo *k8sutil.OwnerInfo) error {
+func (c *ClusterController) reconcileCephCluster(clusterObj *cephv1.CephCluster, ownerInfo *k8sutil.OwnerInfo) error {
 	if clusterObj.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
 		logger.Infof("skipping orchestration for cluster object %q in namespace %q because its cleanup policy is set", clusterObj.Name, clusterObj.Namespace)
 		return nil
@@ -330,50 +352,80 @@ func (c *ClusterController) onAdd(clusterObj *cephv1.CephCluster, ownerInfo *k8s
 	cluster, ok := c.clusterMap[clusterObj.Namespace]
 	if !ok {
 		// It's a new cluster so let's populate the struct
-		cluster = newCluster(clusterObj, c.context, c.csiConfigMutex, ownerInfo)
+		cluster = newCluster(c.OpManagerCtx, clusterObj, c.context, ownerInfo)
 	}
+	cluster.namespacedName = c.namespacedName
+	// updating observedGeneration in cluster if it's not the first reconcile
+	cluster.observedGeneration = clusterObj.ObjectMeta.Generation
 
-	// Note that this lock is held through the callback process, as this creates CSI resources, but we must lock in
-	// this scope as the clusterMap is authoritative on cluster count and thus involved in the check for CSI resource
-	// deletion. If we ever add additional callback functions, we should tighten this lock.
-	c.csiConfigMutex.Lock()
+	// Pass down the client to interact with Kubernetes objects
+	// This will be used later down by spec code to create objects like deployment, services etc
+	cluster.context.Client = c.client
+
+	// Set the spec
+	cluster.Spec = &clusterObj.Spec
+
 	c.clusterMap[cluster.Namespace] = cluster
 	logger.Infof("reconciling ceph cluster in namespace %q", cluster.Namespace)
 
-	for _, callback := range c.addClusterCallbacks {
-		if err := callback(); err != nil {
-			logger.Errorf("%v", err)
-		}
-	}
-	c.csiConfigMutex.Unlock()
-
 	// Start the main ceph cluster orchestration
-	return c.initializeCluster(cluster, clusterObj)
+	return c.initializeCluster(cluster)
 }
 
-func (c *ClusterController) requestClusterDelete(cluster *cephv1.CephCluster) (reconcile.Result, bool) {
-	opcontroller.UpdateCondition(c.context, c.namespacedName, cephv1.ConditionDeleting, corev1.ConditionTrue, cephv1.ClusterDeletingReason, "Cluster is deleting")
+func (c *ClusterController) requestClusterDelete(cluster *cephv1.CephCluster) (reconcile.Result, error) {
+	nsName := fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name)
 
 	if existing, ok := c.clusterMap[cluster.Namespace]; ok && existing.namespacedName.Name != cluster.Name {
-		logger.Errorf("skipping deletion of cluster cr %q in namespace %q. cluster CR %q already exists in this namespace. only one cluster cr per namespace is supported.",
-			cluster.Name, cluster.Namespace, existing.namespacedName.Name)
-		return reconcile.Result{}, true
+		logger.Errorf("skipping deletion of CephCluster %q. CephCluster CR %q already exists in this namespace. only one cluster cr per namespace is supported.",
+			nsName, existing.namespacedName.Name)
+		return reconcile.Result{}, nil // do not requeue the delete
 	}
+	_, err := c.context.ApiExtensionsClient.ApiextensionsV1().CustomResourceDefinitions().Get(c.OpManagerCtx, "networkfences.csiaddons.openshift.io", metav1.GetOptions{})
+	if err == nil {
+		logger.Info("removing networkFence if matching cephCluster UID found")
+		networkFenceList := &addonsv1alpha1.NetworkFenceList{}
+		labelSelector := labels.SelectorFromSet(map[string]string{
+			networkFenceLabel: string(cluster.GetUID()),
+		})
 
-	logger.Infof("delete event for cluster %q in namespace %q", cluster.Name, cluster.Namespace)
-
-	if cluster, ok := c.clusterMap[cluster.Namespace]; ok {
-		// if not already stopped, stop clientcontroller and bucketController
-		if !cluster.closedStopCh {
-			close(cluster.stopCh)
-			cluster.closedStopCh = true
+		opts := []client.DeleteAllOfOption{
+			client.MatchingLabels{
+				networkFenceLabel: string(cluster.GetUID()),
+			},
+			client.GracePeriodSeconds(0),
+		}
+		err = c.client.DeleteAllOf(c.OpManagerCtx, &addonsv1alpha1.NetworkFence{}, opts...)
+		if err != nil && !kerrors.IsNotFound(err) {
+			return reconcile.Result{}, errors.Wrapf(err, "failed to delete networkFence with label %s", networkFenceLabel)
 		}
 
+		err = c.client.List(c.OpManagerCtx, networkFenceList, &client.MatchingLabelsSelector{Selector: labelSelector})
+		if err != nil && !kerrors.IsNotFound(err) {
+			return reconcile.Result{}, errors.Wrap(err, "failed to list networkFence")
+		}
+		if len(networkFenceList.Items) > 0 {
+			for i := range networkFenceList.Items {
+				err = opcontroller.RemoveFinalizerWithName(c.OpManagerCtx, c.client, &networkFenceList.Items[i], "csiaddons.openshift.io/network-fence")
+				if err != nil {
+					return reconcile.Result{}, errors.Wrap(err, "failed to remove finalizer")
+				}
+			}
+		}
+	}
+
+	logger.Infof("cleaning up CephCluster %q", nsName)
+	if cluster, ok := c.clusterMap[cluster.Namespace]; ok {
+		// We used to stop the bucket controller here but when we get a DELETE event for the CephCluster
+		// we will reload the CRD manager anyway so the bucket controller go routine will be stopped
+		// since the op manager context is cancelled.
 		// close the goroutines watching the health of the cluster (mons, osds, ceph status)
 		for _, daemon := range monitorDaemonList {
-			if monitoring, ok := cluster.monitoringChannels[daemon]; ok && monitoring.monitoringRunning {
-				close(cluster.monitoringChannels[daemon].stopChan)
-				cluster.monitoringChannels[daemon].monitoringRunning = false
+			if monitoring, ok := cluster.monitoringRoutines[daemon]; ok && monitoring.InternalCtx.Err() == nil { // if the context hasn't been cancelled
+				// Stop the monitoring routine
+				cluster.monitoringRoutines[daemon].InternalCancel()
+
+				// Remove the monitoring routine from the map
+				delete(cluster.monitoringRoutines, daemon)
 			}
 		}
 	}
@@ -383,25 +435,18 @@ func (c *ClusterController) requestClusterDelete(cluster *cephv1.CephCluster) (r
 	} else {
 		err := c.checkIfVolumesExist(cluster)
 		if err != nil {
-			opcontroller.UpdateCondition(c.context, c.namespacedName, cephv1.ConditionDeleting, corev1.ConditionFalse, "ClusterDeleting", err.Error())
-			logger.Errorf("failed to check if volumes exist. %v", err)
-			return opcontroller.WaitForRequeueIfFinalizerBlocked, false
+			return opcontroller.WaitForRequeueIfFinalizerBlocked, errors.Wrapf(err, "failed to check if volumes exist for CephCluster in namespace %q", cluster.Namespace)
 		}
 	}
 
-	// Only valid when the cluster is not external
 	if cluster.Spec.External.Enable {
 		purgeExternalCluster(c.context.Clientset, cluster.Namespace)
-		return reconcile.Result{}, true
-	}
-
-	// If the StorageClass retain policy of an encrypted cluster with KMS is Delete we also delete the keys
-	if cluster.Spec.Storage.IsOnPVCEncrypted() && cluster.Spec.Security.KeyManagementService.IsEnabled() {
+	} else if cluster.Spec.Storage.IsOnPVCEncrypted() && cluster.Spec.Security.KeyManagementService.IsEnabled() {
+		// If the StorageClass retain policy of an encrypted cluster with KMS is Delete we also delete the keys
 		// Delete keys from KMS
 		err := c.deleteOSDEncryptionKeyFromKMS(cluster)
 		if err != nil {
-			logger.Errorf("failed to delete osd encryption keys from kms. %v", err)
-			return reconcile.Result{}, true
+			logger.Errorf("failed to delete osd encryption keys for CephCluster %q from kms; deletion will continue. %v", nsName, err)
 		}
 	}
 
@@ -409,7 +454,7 @@ func (c *ClusterController) requestClusterDelete(cluster *cephv1.CephCluster) (r
 		delete(c.clusterMap, cluster.Namespace)
 	}
 
-	return reconcile.Result{}, true
+	return reconcile.Result{}, nil
 }
 
 func (c *ClusterController) checkIfVolumesExist(cluster *cephv1.CephCluster) error {
@@ -419,39 +464,7 @@ func (c *ClusterController) checkIfVolumesExist(cluster *cephv1.CephCluster) err
 			return err
 		}
 	}
-	if !opcontroller.FlexDriverEnabled(c.context) {
-		logger.Debugf("Flex driver disabled, skipping check for volume attachments for cluster %q", cluster.Namespace)
-		return nil
-	}
-	return c.flexVolumesAllowForDeletion(cluster)
-}
-
-func (c *ClusterController) flexVolumesAllowForDeletion(cluster *cephv1.CephCluster) error {
-	operatorNamespace := os.Getenv(k8sutil.PodNamespaceEnvVar)
-	vols, err := c.volumeAttachment.List(operatorNamespace)
-	if err != nil {
-		return errors.Wrapf(err, "failed to get volume attachments for operator namespace %q", operatorNamespace)
-	}
-
-	// find volume attachments in the deleted cluster
-	attachmentsExist := false
-AttachmentLoop:
-	for _, vol := range vols.Items {
-		for _, a := range vol.Attachments {
-			if a.ClusterName == cluster.Namespace {
-				// there is still an outstanding volume attachment in the cluster that is being deleted.
-				attachmentsExist = true
-				break AttachmentLoop
-			}
-		}
-	}
-
-	if !attachmentsExist {
-		logger.Infof("no volume attachments for cluster %q to clean up.", cluster.Namespace)
-		return nil
-	}
-
-	return errors.Errorf("waiting for volume attachments in cluster %q to be cleaned up.", cluster.Namespace)
+	return nil
 }
 
 func (c *ClusterController) csiVolumesAllowForDeletion(cluster *cephv1.CephCluster) error {
@@ -473,8 +486,7 @@ func (c *ClusterController) csiVolumesAllowForDeletion(cluster *cephv1.CephClust
 }
 
 func (c *ClusterController) checkPVPresentInCluster(drivers []string, clusterID string) (bool, error) {
-	ctx := context.TODO()
-	pv, err := c.context.Clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	pv, err := c.context.Clientset.CoreV1().PersistentVolumes().List(c.OpManagerCtx, metav1.ListOptions{})
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to list PV")
 	}
@@ -497,67 +509,90 @@ func (c *ClusterController) checkPVPresentInCluster(drivers []string, clusterID 
 	return false, nil
 }
 
-// updateStatus updates an object with a given status
-func updateStatus(client client.Client, name types.NamespacedName, status cephv1.ConditionType) {
-	cephCluster := &cephv1.CephCluster{}
-	err := client.Get(context.TODO(), name, cephCluster)
+func (r *ReconcileCephCluster) removeFinalizers(client client.Client, clusterName types.NamespacedName) error {
+
+	// Remove finalizer for rook-ceph-mon secret
+	name := types.NamespacedName{Name: mon.AppName, Namespace: clusterName.Namespace}
+	err := r.removeFinalizer(client, name, &corev1.Secret{}, mon.DisasterProtectionFinalizerName)
 	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("CephCluster resource not found. Ignoring since object must be deleted.")
-			return
-		}
-		logger.Warningf("failed to retrieve ceph cluster %q to update status to %q. %v", name, status, err)
-		return
+		return errors.Wrapf(err, "failed to remove finalizer for the secret %q", name.Name)
 	}
 
-	cephCluster.Status.Phase = status
-	if err := opcontroller.UpdateStatus(client, cephCluster); err != nil {
-		logger.Errorf("failed to set ceph cluster %q status to %q. %v", cephCluster.Name, status, err)
-		return
-	}
-	logger.Debugf("ceph cluster %q status updated to %q", name, status)
-}
-
-// removeFinalizer removes a finalizer
-func removeFinalizer(client client.Client, name types.NamespacedName) error {
-	cephCluster := &cephv1.CephCluster{}
-	err := client.Get(context.TODO(), name, cephCluster)
+	// Remove finalizer for rook-ceph-mon-endpoints configmap
+	name = types.NamespacedName{Name: mon.EndpointConfigMapName, Namespace: clusterName.Namespace}
+	err = r.removeFinalizer(client, name, &corev1.ConfigMap{}, mon.DisasterProtectionFinalizerName)
 	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("CephCluster resource not found. Ignoring since object must be deleted.")
-			return nil
-		}
-		return errors.Wrapf(err, "failed to retrieve ceph cluster %q to remove finalizer", name.Name)
+		return errors.Wrapf(err, "failed to remove finalizer for the configmap %q", name.Name)
 	}
 
-	err = opcontroller.RemoveFinalizer(client, cephCluster)
+	// Remove cephcluster finalizer
+	err = r.removeFinalizer(client, clusterName, &cephv1.CephCluster{}, "")
 	if err != nil {
-		return errors.Wrap(err, "failed to remove finalizer")
+		return errors.Wrap(err, "failed to remove cephcluster finalizer")
 	}
 
 	return nil
 }
 
+func (r *ReconcileCephCluster) removeFinalizer(client client.Client, name types.NamespacedName, obj client.Object, finalizer string) error {
+	err := client.Get(r.opManagerContext, name, obj)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			logger.Debugf("%s resource not found. Ignoring since object must be deleted.", name.Name)
+			return nil
+		}
+		return errors.Wrapf(err, "failed to retrieve %q to remove finalizer", name.Name)
+	}
+
+	if finalizer == "" {
+		err = opcontroller.RemoveFinalizer(r.opManagerContext, client, obj)
+		if err != nil {
+			return errors.Wrap(err, "failed to remove finalizer")
+		}
+	} else {
+		err = opcontroller.RemoveFinalizerWithName(r.opManagerContext, client, obj, finalizer)
+		if err != nil {
+			return errors.Wrapf(err, "failed to remove finalizer %q", finalizer)
+		}
+	}
+	return nil
+}
+
 func (c *ClusterController) deleteOSDEncryptionKeyFromKMS(currentCluster *cephv1.CephCluster) error {
+	// At the point, the CephCluster has been deleted and the context cancelled, so we need to use a
+	// new context here
+	// So do NOT use another context
+	ctx := context.TODO()
 	// If the operator was stopped and we enter this code, the map is empty
 	if _, ok := c.clusterMap[currentCluster.Namespace]; !ok {
 		c.clusterMap[currentCluster.Namespace] = &cluster{ClusterInfo: &cephclient.ClusterInfo{Namespace: currentCluster.Namespace}}
 	}
 
 	// Fetch PVCs
-	osdPVCs, _, err := osd.GetExistingPVCs(c.context, currentCluster.Namespace)
+	osdPVCs, _, err := osd.GetExistingPVCs(c.OpManagerCtx, c.context, currentCluster.Namespace)
 	if err != nil {
 		return errors.Wrap(err, "failed to list osd pvc")
 	}
 
 	// Initialize the KMS code
 	kmsConfig := kms.NewConfig(c.context, &currentCluster.Spec, c.clusterMap[currentCluster.Namespace].ClusterInfo)
+	kmsConfig.ClusterInfo.Context = ctx
 
 	// If token auth is used by the KMS we set it as an env variable
-	if currentCluster.Spec.Security.KeyManagementService.IsTokenAuthEnabled() {
-		err := kms.SetTokenToEnvVar(c.context, currentCluster.Spec.Security.KeyManagementService.TokenSecretName, kmsConfig.Provider, currentCluster.Namespace)
+	if currentCluster.Spec.Security.KeyManagementService.IsTokenAuthEnabled() && currentCluster.Spec.Security.KeyManagementService.IsVaultKMS() {
+		err := kms.SetTokenToEnvVar(ctx, c.context, currentCluster.Spec.Security.KeyManagementService.TokenSecretName, kmsConfig.Provider, currentCluster.Namespace)
 		if err != nil {
 			return errors.Wrapf(err, "failed to fetch kms token secret %q", currentCluster.Spec.Security.KeyManagementService.TokenSecretName)
+		}
+	}
+
+	// We need to fetch the IBM_KP_SERVICE_API_KEY value and KMIP kms related values too.
+	if currentCluster.Spec.Security.KeyManagementService.IsIBMKeyProtectKMS() || currentCluster.Spec.Security.KeyManagementService.IsKMIPKMS() {
+		// This will validate the connection details again and will add the IBM_KP_SERVICE_API_KEY to the spec and
+		// token details required for KMIP kms is added too.
+		err = kms.ValidateConnectionDetails(ctx, c.context, &currentCluster.Spec.Security.KeyManagementService, currentCluster.Namespace)
+		if err != nil {
+			return errors.Wrap(err, "failed to validate kms connection details to delete the secret")
 		}
 	}
 

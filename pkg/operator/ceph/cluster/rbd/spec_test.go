@@ -23,9 +23,9 @@ import (
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
-
 	"github.com/rook/rook/pkg/operator/ceph/test"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -48,8 +48,9 @@ func TestPodSpec(t *testing.T) {
 		},
 		Spec: cephv1.ClusterSpec{
 			CephVersion: cephv1.CephVersionSpec{
-				Image: "ceph/ceph:v15",
+				Image: "quay.io/ceph/ceph:v15",
 			},
+			DataDirHostPath: "/var/lib/rook",
 		},
 	}
 
@@ -75,7 +76,7 @@ func TestPodSpec(t *testing.T) {
 		TypeMeta: controllerTypeMeta,
 	}
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Squid,
 	}
 	s := scheme.Scheme
 	object := []runtime.Object{rbdMirror}
@@ -87,16 +88,17 @@ func TestPodSpec(t *testing.T) {
 	d, err := r.makeDeployment(&daemonConf, rbdMirror)
 	assert.NoError(t, err)
 	assert.Equal(t, "rook-ceph-rbd-mirror-a", d.Name)
-	assert.Equal(t, 4, len(d.Spec.Template.Spec.Volumes))
+	assert.Equal(t, 5, len(d.Spec.Template.Spec.Volumes))
 	assert.Equal(t, 1, len(d.Spec.Template.Spec.Volumes[0].Projected.Sources))
-	assert.Equal(t, 4, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
+	assert.Equal(t, 5, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
+	assert.Equal(t, k8sutil.DefaultServiceAccount, d.Spec.Template.Spec.ServiceAccountName)
 
 	// Deployment should have Ceph labels
 	test.AssertLabelsContainCephRequirements(t, d.ObjectMeta.Labels,
-		config.RbdMirrorType, "a", AppName, "ns")
+		config.RbdMirrorType, "a", AppName, "ns", "a", "cephrbdmirrors.ceph.rook.io", "ceph-rbd-mirror")
 
 	podTemplate := test.NewPodTemplateSpecTester(t, &d.Spec.Template)
-	podTemplate.RunFullSuite(config.RbdMirrorType, "a", AppName, "ns", "ceph/ceph:myceph",
+	podTemplate.RunFullSuite(config.RbdMirrorType, "a", AppName, "ns", "quay.io/ceph/ceph:myceph",
 		"200", "100", "600", "300", /* resources */
-		"my-priority-class")
+		"my-priority-class", "a", "cephrbdmirrors.ceph.rook.io", "ceph-rbd-mirror")
 }

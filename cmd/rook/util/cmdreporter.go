@@ -17,8 +17,12 @@ limitations under the License.
 package util
 
 import (
+	"context"
 	"fmt"
+	"os/signal"
+
 	"github.com/rook/rook/pkg/daemon/util"
+	operator "github.com/rook/rook/pkg/operator/ceph"
 
 	"github.com/rook/rook/cmd/rook/rook"
 	"github.com/spf13/cobra"
@@ -40,10 +44,11 @@ reported, even if the command's return code is nonzero (failure). Run will
 terminate if the command could not be run for any reason or if there was an
 error storing the command results into the ConfigMap. An application label
 is applied to the ConfigMap. Run will also terminate if the label already
-exists and has a different application's name name; this may indicate that
+exists and has a different application's name; this may indicate that
 it is not safe for cmd-reporter to edit the ConfigMap.`,
-	Args: cobra.NoArgs,
-	Run:  runCmdReporter,
+	Args:   cobra.NoArgs,
+	Run:    runCmdReporter,
+	Hidden: true, // do not advertise to end users
 }
 
 var (
@@ -51,9 +56,6 @@ var (
 	commandString string
 	configMapName string
 	namespace     string
-
-	// copy-binaries sub-command
-	copyToDir string
 )
 
 func init() {
@@ -77,13 +79,17 @@ func init() {
 }
 
 func runCmdReporter(cCmd *cobra.Command, cArgs []string) {
+	// Initialize the context
+	ctx, cancel := signal.NotifyContext(context.Background(), operator.ShutdownSignals...)
+	defer cancel()
+
 	cmd, args, err := util.CmdReporterFlagArgumentToCommand(commandString)
 	if err != nil {
 		rook.TerminateFatal(fmt.Errorf("failed to parse '--command' argument [%s]. %+v", commandString, err))
 	}
 
 	context := rook.NewContext()
-	reporter, err := util.NewCmdReporter(context.Clientset, cmd, args, configMapName, namespace)
+	reporter, err := util.NewCmdReporter(ctx, context.Clientset, cmd, args, configMapName, namespace)
 	if err != nil {
 		rook.TerminateFatal(fmt.Errorf("cannot start command-reporter. %+v", err))
 	}

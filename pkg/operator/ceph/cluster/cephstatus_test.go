@@ -25,10 +25,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	optest "github.com/rook/rook/pkg/operator/test"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -102,6 +104,7 @@ func TestCephStatus(t *testing.T) {
 		PgMap: cephclient.PgMap{TotalBytes: 0},
 	}
 	aggregateStatus = toCustomResourceStatus(currentStatus, newStatus)
+	// nolint:gosec // G115 no overflow expected in the test
 	assert.Equal(t, 0, int(aggregateStatus.Capacity.TotalBytes))
 	assert.Equal(t, "", aggregateStatus.Capacity.LastUpdated)
 
@@ -110,6 +113,7 @@ func TestCephStatus(t *testing.T) {
 		PgMap: cephclient.PgMap{TotalBytes: 1024},
 	}
 	aggregateStatus = toCustomResourceStatus(currentStatus, newStatus)
+	// nolint:gosec // G115 no overflow expected in the test
 	assert.Equal(t, 1024, int(aggregateStatus.Capacity.TotalBytes))
 	assert.Equal(t, formatTime(time.Now().UTC()), aggregateStatus.Capacity.LastUpdated)
 
@@ -121,12 +125,13 @@ func TestCephStatus(t *testing.T) {
 	}
 
 	aggregateStatus = toCustomResourceStatus(currentStatus, newStatus)
+	// nolint:gosec // G115 no overflow expected in the test
 	assert.Equal(t, 1024, int(aggregateStatus.Capacity.TotalBytes))
 	assert.Equal(t, formatTime(time.Now().Add(-time.Minute).UTC()), formatTime(time.Now().Add(-time.Minute).UTC()))
 }
 
 func TestNewCephStatusChecker(t *testing.T) {
-	clusterInfo := cephclient.AdminClusterInfo("ns")
+	clusterInfo := cephclient.AdminTestClusterInfo("ns")
 	c := &clusterd.Context{}
 	time10s, err := time.ParseDuration("10s")
 	assert.NoError(t, err)
@@ -150,6 +155,89 @@ func TestNewCephStatusChecker(t *testing.T) {
 			if got := newCephStatusChecker(tt.args.context, tt.args.clusterInfo, tt.args.clusterSpec); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("newCephStatusChecker() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestConfigureHealthSettings(t *testing.T) {
+	c := &cephStatusChecker{
+		context:     &clusterd.Context{},
+		clusterInfo: cephclient.AdminTestClusterInfo("ns"),
+	}
+	setGlobalIDReclaim := false
+	c.context.Executor = &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			logger.Infof("Command: %s %v", command, args)
+			if args[0] == "config" && args[3] == "auth_allow_insecure_global_id_reclaim" {
+				if args[1] == "set" {
+					setGlobalIDReclaim = true
+					return "", nil
+				}
+			}
+			return "", errors.New("mock error to simulate failure of mon store config")
+		},
+	}
+	noActionOneWarningStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"MDS_ALL_DOWN": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "MDS_ALL_DOWN",
+					},
+				},
+			},
+		},
+	}
+	disableInsecureGlobalIDStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "foo",
+					},
+				},
+			},
+		},
+	}
+	noDisableInsecureGlobalIDStatus := cephclient.CephStatus{
+		Health: cephclient.HealthStatus{
+			Checks: map[string]cephclient.CheckMessage{
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "foo",
+					},
+				},
+				"AUTH_INSECURE_GLOBAL_ID_RECLAIM": {
+					Severity: "HEALTH_WARN",
+					Summary: cephclient.Summary{
+						Message: "bar",
+					},
+				},
+			},
+		},
+	}
+
+	type args struct {
+		status                     cephclient.CephStatus
+		expectedSetGlobalIDSetting bool
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{"no-warnings", args{cephclient.CephStatus{}, false}},
+		{"no-action-one-warning", args{noActionOneWarningStatus, false}},
+		{"disable-insecure-global-id", args{disableInsecureGlobalIDStatus, true}},
+		{"no-disable-insecure-global-id", args{noDisableInsecureGlobalIDStatus, false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setGlobalIDReclaim = false
+			c.configureHealthSettings(tt.args.status)
+			assert.Equal(t, tt.args.expectedSetGlobalIDSetting, setGlobalIDReclaim)
 		})
 	}
 }
@@ -198,7 +286,7 @@ func TestForceDeleteStuckRookPodsOnNotReadyNodes(t *testing.T) {
 	}
 
 	// There should be no error
-	err = c.forceDeleteStuckRookPodsOnNotReadyNodes()
+	err = c.forceDeleteStuckRookPodsOnNotReadyNodes(ctx)
 	assert.NoError(t, err)
 
 	// The pod should still exist since its not deleted.
@@ -212,7 +300,7 @@ func TestForceDeleteStuckRookPodsOnNotReadyNodes(t *testing.T) {
 	assert.NoError(t, err)
 
 	// There should be no error as the pod is deleted
-	err = c.forceDeleteStuckRookPodsOnNotReadyNodes()
+	err = c.forceDeleteStuckRookPodsOnNotReadyNodes(ctx)
 	assert.NoError(t, err)
 
 	// The pod should be deleted since the pod is marked as deleted and the node is in NotReady state
@@ -241,6 +329,8 @@ func TestGetRookPodsOnNode(t *testing.T) {
 		{"app": "csi-rbdplugin"},
 		{"app": "csi-cephfsplugin-provisioner"},
 		{"app": "csi-cephfsplugin"},
+		{"app": "csi-nfsplugin-provisioner"},
+		{"app": "csi-nfsplugin"},
 		{"app": "rook-ceph-operator"},
 		{"app": "rook-ceph-crashcollector"},
 		{"app": "rook-ceph-mgr"},
@@ -248,6 +338,7 @@ func TestGetRookPodsOnNode(t *testing.T) {
 		{"app": "rook-ceph-rgw"},
 		{"app": "user-app"},
 		{"app": "rook-ceph-mon"},
+		{"app": "rook-ceph-exporter"},
 	}
 
 	pod := v1.Pod{
@@ -275,7 +366,7 @@ func TestGetRookPodsOnNode(t *testing.T) {
 	pods, err := c.getRookPodsOnNode("node0")
 	assert.NoError(t, err)
 	// A pod is having two matching labels and its returned only once
-	assert.Equal(t, 11, len(pods))
+	assert.Equal(t, 14, len(pods))
 
 	podNames := []string{}
 	for _, pod := range pods {

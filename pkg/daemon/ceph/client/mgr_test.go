@@ -21,7 +21,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/operator/ceph/version"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -30,7 +30,7 @@ func TestEnableModuleRetries(t *testing.T) {
 	moduleEnableRetries := 0
 	moduleEnableWaitTime = 0
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		switch {
 		case args[0] == "balancer" && args[1] == "on":
@@ -52,7 +52,7 @@ func TestEnableModuleRetries(t *testing.T) {
 
 	}
 
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 	_ = MgrEnableModule(&clusterd.Context{Executor: executor}, clusterInfo, "invalidModuleName", false)
 	assert.Equal(t, 5, moduleEnableRetries)
 
@@ -60,21 +60,14 @@ func TestEnableModuleRetries(t *testing.T) {
 	_ = MgrEnableModule(&clusterd.Context{Executor: executor}, clusterInfo, "pg_autoscaler", false)
 	assert.Equal(t, 0, moduleEnableRetries)
 
-	// Balancer not on Ceph Pacific
-	moduleEnableRetries = 0
+	// Balancer skipped
 	_ = MgrEnableModule(&clusterd.Context{Executor: executor}, clusterInfo, "balancer", false)
 	assert.Equal(t, 0, moduleEnableRetries)
-
-	// Balancer skipped on Pacific
-	clusterInfo.CephVersion = version.Pacific
-	_ = MgrEnableModule(&clusterd.Context{Executor: executor}, clusterInfo, "balancer", false)
-	assert.Equal(t, 0, moduleEnableRetries)
-
 }
 
 func TestEnableModule(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		switch {
 		case args[0] == "mgr" && args[1] == "module" && args[2] == "enable":
@@ -91,7 +84,7 @@ func TestEnableModule(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 	err := enableModule(&clusterd.Context{Executor: executor}, clusterInfo, "pg_autoscaler", true, "enable")
 	assert.NoError(t, err)
 
@@ -107,7 +100,7 @@ func TestEnableModule(t *testing.T) {
 
 func TestEnableDisableBalancerModule(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		switch {
 		case args[0] == "balancer" && args[1] == "on":
@@ -121,7 +114,7 @@ func TestEnableDisableBalancerModule(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 	err := enableDisableBalancerModule(&clusterd.Context{Executor: executor}, clusterInfo, "on")
 	assert.NoError(t, err)
 
@@ -131,7 +124,7 @@ func TestEnableDisableBalancerModule(t *testing.T) {
 
 func TestSetBalancerMode(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "balancer" && args[1] == "mode" && args[2] == "upmap" {
 			return "", nil
@@ -140,6 +133,40 @@ func TestSetBalancerMode(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := setBalancerMode(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"), "upmap")
+	err := setBalancerMode(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"), "upmap")
 	assert.NoError(t, err)
+}
+
+func TestGetMinCompatClientVersion(t *testing.T) {
+	clusterInfo := AdminTestClusterInfo("mycluster")
+	t.Run("upmap-read balancer mode with ceph v19", func(t *testing.T) {
+		clusterInfo.CephVersion = cephver.CephVersion{Major: 19}
+		result, err := desiredMinCompatClientVersion(clusterInfo, upmapReadBalancerMode)
+		assert.NoError(t, err)
+		assert.Equal(t, "reef", result)
+	})
+
+	t.Run("read balancer mode with ceph v19", func(t *testing.T) {
+		clusterInfo.CephVersion = cephver.CephVersion{Major: 19}
+		result, err := desiredMinCompatClientVersion(clusterInfo, readBalancerMode)
+		assert.NoError(t, err)
+		assert.Equal(t, "reef", result)
+	})
+	t.Run("upmap-read balancer mode with ceph below v19 should fail", func(t *testing.T) {
+		clusterInfo.CephVersion = cephver.CephVersion{Major: 18}
+		_, err := desiredMinCompatClientVersion(clusterInfo, upmapReadBalancerMode)
+		assert.Error(t, err)
+	})
+	t.Run("read balancer mode with ceph below v19 should fail", func(t *testing.T) {
+		clusterInfo.CephVersion = cephver.CephVersion{Major: 18}
+		_, err := desiredMinCompatClientVersion(clusterInfo, readBalancerMode)
+		assert.Error(t, err)
+	})
+
+	t.Run("upmap balancer set min compat client to luminous", func(t *testing.T) {
+		clusterInfo.CephVersion = cephver.CephVersion{Major: 19}
+		result, err := desiredMinCompatClientVersion(clusterInfo, "upmap")
+		assert.NoError(t, err)
+		assert.Equal(t, "luminous", result)
+	})
 }

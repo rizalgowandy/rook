@@ -17,15 +17,19 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 var (
@@ -42,9 +46,11 @@ func TestObjectChanged(t *testing.T) {
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: cephv1.PoolSpec{
-			Replicated: cephv1.ReplicatedSpec{
-				Size: oldReplicas,
+		Spec: cephv1.NamedBlockPoolSpec{
+			PoolSpec: cephv1.PoolSpec{
+				Replicated: cephv1.ReplicatedSpec{
+					Size: oldReplicas,
+				},
 			},
 		},
 		Status: &cephv1.CephBlockPoolStatus{
@@ -57,9 +63,11 @@ func TestObjectChanged(t *testing.T) {
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: cephv1.PoolSpec{
-			Replicated: cephv1.ReplicatedSpec{
-				Size: oldReplicas,
+		Spec: cephv1.NamedBlockPoolSpec{
+			PoolSpec: cephv1.PoolSpec{
+				Replicated: cephv1.ReplicatedSpec{
+					Size: oldReplicas,
+				},
 			},
 		},
 		Status: &cephv1.CephBlockPoolStatus{
@@ -90,18 +98,18 @@ func TestIsUpgrade(t *testing.T) {
 	assert.False(t, b)
 
 	// different value do something
-	newLabel["ceph_version"] = "15.2.0-octopus"
+	newLabel["ceph_version"] = "19.2.0-squid"
 	b = isUpgrade(oldLabel, newLabel)
 	assert.True(t, b, fmt.Sprintf("%v,%v", oldLabel, newLabel))
 
 	// same value do nothing
-	oldLabel["ceph_version"] = "15.2.0-octopus"
-	newLabel["ceph_version"] = "15.2.0-octopus"
+	oldLabel["ceph_version"] = "19.2.0-squid"
+	newLabel["ceph_version"] = "19.2.0-squid"
 	b = isUpgrade(oldLabel, newLabel)
 	assert.False(t, b, fmt.Sprintf("%v,%v", oldLabel, newLabel))
 
 	// different value do something
-	newLabel["ceph_version"] = "15.2.1-octopus"
+	newLabel["ceph_version"] = "19.2.1-squid"
 	b = isUpgrade(oldLabel, newLabel)
 	assert.True(t, b, fmt.Sprintf("%v,%v", oldLabel, newLabel))
 }
@@ -156,16 +164,39 @@ func TestIsCanary(t *testing.T) {
 
 func TestIsCMToIgnoreOnUpdate(t *testing.T) {
 	blockPool := &cephv1.CephBlockPool{}
-	assert.False(t, isCMTConfigOverride(blockPool))
+	reconcile := shouldReconcileCM(blockPool, blockPool)
+	assert.False(t, reconcile)
 
 	cm := &corev1.ConfigMap{}
-	assert.False(t, isCMTConfigOverride(cm))
+	reconcile = shouldReconcileCM(cm, cm)
+	assert.False(t, reconcile)
 
 	cm.Name = "rook-ceph-mon-endpoints"
-	assert.False(t, isCMTConfigOverride(cm))
+	reconcile = shouldReconcileCM(cm, cm)
+	assert.False(t, reconcile)
 
+	// Valid name, but cm completely empty
 	cm.Name = "rook-config-override"
-	assert.True(t, isCMTConfigOverride(cm))
+	oldCM := &corev1.ConfigMap{}
+	oldCM.Name = cm.Name
+	reconcile = shouldReconcileCM(oldCM, cm)
+	assert.False(t, reconcile)
+
+	// Both have empty config value
+	cm.Data = map[string]string{"config": ""}
+	oldCM.Data = map[string]string{"config": ""}
+	reconcile = shouldReconcileCM(oldCM, cm)
+	assert.False(t, reconcile)
+
+	// Something added to the CM
+	cm.Data = map[string]string{"config": "somevalue"}
+	reconcile = shouldReconcileCM(oldCM, cm)
+	assert.True(t, reconcile)
+
+	// A value changed in the CM
+	oldCM.Data = map[string]string{"config": "diffvalue"}
+	reconcile = shouldReconcileCM(oldCM, cm)
+	assert.True(t, reconcile)
 }
 
 func TestIsCMToIgnoreOnDelete(t *testing.T) {
@@ -214,4 +245,58 @@ func TestIsDoNotReconcile(t *testing.T) {
 	l["do_not_reconcile"] = "true"
 	b = IsDoNotReconcile(l)
 	assert.True(t, b)
+}
+
+func TestDuplicateCephClusters(t *testing.T) {
+	ctx := context.TODO()
+	namespace := "rook-ceph"
+	cephCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-a",
+			Namespace: namespace,
+		},
+	}
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
+
+	t.Run("success - only one ceph cluster", func(t *testing.T) {
+		object := []runtime.Object{
+			cephCluster,
+		}
+		// Create a fake client to mock API calls.
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		assert.False(t, DuplicateCephClusters(ctx, cl, cephCluster, false))
+	})
+
+	t.Run("success - we have more than one cluster but they are in different namespaces", func(t *testing.T) {
+		dup := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cluster-b",
+				Namespace: "anotherns",
+			},
+		}
+		object := []runtime.Object{
+			cephCluster,
+			dup,
+		}
+		// Create a fake client to mock API calls.
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		assert.False(t, DuplicateCephClusters(ctx, cl, dup, true))
+	})
+
+	t.Run("fail - we have more than one cluster in the same namespace", func(t *testing.T) {
+		dup := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cluster-b",
+				Namespace: namespace,
+			},
+		}
+		object := []runtime.Object{
+			cephCluster,
+			dup,
+		}
+		// Create a fake client to mock API calls.
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		assert.True(t, DuplicateCephClusters(ctx, cl, dup, true))
+	})
 }

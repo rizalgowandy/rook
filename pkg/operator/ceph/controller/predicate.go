@@ -17,11 +17,17 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
 	"strings"
+	"syscall"
 
 	"github.com/banzaicloud/k8s-objectmatcher/patch"
 	"github.com/google/go-cmp/cmp"
+	bktv1alpha1 "github.com/kube-object-storage/lib-bucket-provisioner/pkg/apis/objectbucket.io/v1alpha1"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/config"
@@ -31,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
@@ -41,22 +48,22 @@ const (
 )
 
 // WatchControllerPredicate is a special update filter for update events
-// do not reconcile if the the status changes, this avoids a reconcile storm loop
+// do not reconcile if the status changes, this avoids a reconcile storm loop
 //
 // returning 'true' means triggering a reconciliation
 // returning 'false' means do NOT trigger a reconciliation
 func WatchControllerPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			logger.Debug("create event from a CR")
+			logger.Debugf("create event from a CR: %q", e.Object.GetName())
 			return true
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
-			logger.Debug("delete event from a CR")
+			logger.Debugf("delete event from a CR: %q", e.Object.GetName())
 			return true
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			logger.Debug("update event from a CR")
+			logger.Debugf("update event from a CR: %q", e.ObjectOld.GetName())
 			// resource.Quantity has non-exportable fields, so we use its comparator method
 			resourceQtyComparer := cmp.Comparer(func(x, y resource.Quantity) bool { return x.Cmp(y) == 0 })
 
@@ -74,7 +81,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -99,7 +106,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -119,7 +126,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -139,7 +146,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -159,7 +166,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -179,7 +186,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -199,7 +206,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -224,7 +231,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -249,7 +256,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -274,7 +281,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -299,7 +306,7 @@ func WatchControllerPredicate() predicate.Funcs {
 				if diff != "" {
 					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
 					return true
-				} else if objOld.GetDeletionTimestamp() != objNew.GetDeletionTimestamp() {
+				} else if objectToBeDeleted(objOld, objNew) {
 					logger.Debugf("CR %q is going be deleted", objNew.Name)
 					return true
 				} else if objOld.GetGeneration() != objNew.GetGeneration() {
@@ -310,8 +317,154 @@ func WatchControllerPredicate() predicate.Funcs {
 				if isUpgrade {
 					return true
 				}
-			}
 
+			case *cephv1.CephBucketTopic:
+				objNew := e.ObjectNew.(*cephv1.CephBucketTopic)
+				logger.Debug("update event on CephBucketTopic CR")
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing", objNew.Name, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+				if diff != "" {
+					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CR %q is going be deleted", objNew.Name)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping resource %q update with unchanged spec", objNew.Name)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
+			case *cephv1.CephBucketNotification:
+				objNew := e.ObjectNew.(*cephv1.CephBucketNotification)
+				logger.Debug("update event on CephBucketNotification CR")
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing", objNew.Name, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+				if diff != "" {
+					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CR %q is going be deleted", objNew.Name)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping resource %q update with unchanged spec", objNew.Name)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
+			case *cephv1.CephFilesystemSubVolumeGroup:
+				objNew := e.ObjectNew.(*cephv1.CephFilesystemSubVolumeGroup)
+				logger.Debug("update event on CephFilesystemSubVolumeGroup CR")
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing", objNew.Name, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+				if diff != "" {
+					logger.Infof("CR has changed for %q. diff=%s", objNew.Name, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CR %q is going be deleted", objNew.Name)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping resource %q update with unchanged spec", objNew.Name)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
+			case *bktv1alpha1.ObjectBucketClaim:
+				objNew := e.ObjectNew.(*bktv1alpha1.ObjectBucketClaim)
+				logger.Debug("update event on ObjectBucketClaim CR")
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing", objNew.Name, DoNotReconcileLabelName)
+					return false
+				}
+				if !reflect.DeepEqual(objOld.Labels, objNew.Labels) {
+					logger.Infof("CR labels has changed for %q", objNew.Name)
+					return true
+				} else if objOld.Spec.ObjectBucketName != objNew.Spec.ObjectBucketName {
+					logger.Infof("CR %q bucket name changed from %q to %q", objNew.Name, objOld.Spec.ObjectBucketName, objNew.Spec.ObjectBucketName)
+					return true
+				}
+				logger.Debugf("no change in CR %q", objNew.Name)
+
+			case *cephv1.CephBlockPoolRadosNamespace:
+				objNew := e.ObjectNew.(*cephv1.CephBlockPoolRadosNamespace)
+				namespacedName := fmt.Sprintf("%s/%s", objNew.Namespace, objNew.Name)
+				logger.Debugf("update event on CephBlockPoolRadosNamespace %q CR", namespacedName)
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing", namespacedName, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+				if diff != "" {
+					logger.Infof("CephBlockPoolRadosNamespace CR has changed for %q. diff=%s", namespacedName, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CephBlockPoolRadosNamespace CR %q is going be deleted", namespacedName)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping CephBlockPoolRadosNamespace resource %q update with unchanged spec", namespacedName)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
+			case *cephv1.CephCOSIDriver:
+				objNew := e.ObjectNew.(*cephv1.CephCOSIDriver)
+				namespacedName := fmt.Sprintf("%s/%s", objNew.Namespace, objNew.Name)
+				logger.Debug("update event on CephCOSIDriver %q CR", namespacedName)
+				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+				IsDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
+				if IsDoNotReconcile {
+					logger.Debugf("object %q matched on update but %q label is set, doing nothing",
+						namespacedName, DoNotReconcileLabelName)
+					return false
+				}
+				diff := cmp.Diff(objOld.Spec, objNew.Spec)
+				if diff != "" {
+					logger.Infof("CephCOSIDriver CR has changed for %q. diff=%s", namespacedName, diff)
+					return true
+				} else if objectToBeDeleted(objOld, objNew) {
+					logger.Debugf("CephCOSIDriver CR %q is going be deleted", namespacedName)
+					return true
+				} else if objOld.GetGeneration() != objNew.GetGeneration() {
+					logger.Debugf("skipping CephCOSIDriver resource %q update with unchanged spec", namespacedName)
+				}
+				// Handling upgrades
+				isUpgrade := isUpgrade(objOld.GetLabels(), objNew.GetLabels())
+				if isUpgrade {
+					return true
+				}
+
+			}
 			return false
 		},
 		GenericFunc: func(e event.GenericEvent) bool {
@@ -320,57 +473,8 @@ func WatchControllerPredicate() predicate.Funcs {
 	}
 }
 
-// WatchCephClusterPredicate is a predicate used by child controllers such as Filesystem or Object
-// It watch for CR changes on the CephCluster object and reconciles if this needs to be propagated
-// For instance the logCollector option from the CephCluster spec affects the configuration of rgw pods
-// So if it changes we must update the deployment
-func WatchCephClusterPredicate() predicate.Funcs {
-	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			logger.Debug("create event from a CR")
-			return true
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			logger.Debug("delete event from a CR")
-			return true
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			logger.Debug("update event from a CR")
-			// resource.Quantity has non-exportable fields, so we use its comparator method
-			resourceQtyComparer := cmp.Comparer(func(x, y resource.Quantity) bool { return x.Cmp(y) == 0 })
-
-			switch objOld := e.ObjectOld.(type) {
-			case *cephv1.CephCluster:
-				objNew := e.ObjectNew.(*cephv1.CephCluster)
-				logger.Debug("update event on CephCluster CR")
-				// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
-				isDoNotReconcile := IsDoNotReconcile(objNew.GetLabels())
-				if isDoNotReconcile {
-					logger.Debugf("object %q matched on update but %q label is set, doing nothing", DoNotReconcileLabelName, objNew.Name)
-					return false
-				}
-				diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
-				if diff != "" {
-					// The image change (upgrade) is being taking care by watchControllerPredicate() in the cluster package
-					if objOld.Spec.CephVersion.Image != objNew.Spec.CephVersion.Image {
-						return false
-					}
-					// If the log collector setting changes let's reconcile the child controllers
-					if !cmp.Equal(objOld.Spec.LogCollector, objNew.Spec.LogCollector) {
-						logger.Debug("log collector option changed, reconciling")
-						return true
-					}
-				} else if objOld.GetGeneration() != objNew.GetGeneration() {
-					logger.Debugf("skipping resource %q update with unchanged spec", objNew.Name)
-				}
-			}
-
-			return false
-		},
-		GenericFunc: func(e event.GenericEvent) bool {
-			return false
-		},
-	}
+func objectToBeDeleted(oldObj, newObj client.Object) bool {
+	return !oldObj.GetDeletionTimestamp().Equal(newObj.GetDeletionTimestamp())
 }
 
 // objectChanged checks whether the object has been updated
@@ -445,9 +549,8 @@ func WatchPredicateForNonCRDObject(owner runtime.Object, scheme *runtime.Scheme)
 					return false
 				}
 
-				// If the resource is a canary deployment we don't reconcile because it's ephemeral
-				isCanary := isCanary(e.Object)
-				if isCanary {
+				// If the resource is a canary, crash collector, or exporter we don't reconcile because it's ephemeral
+				if isCanary(e.Object) || isCrashCollector(e.Object) || isExporter(e.Object) {
 					return false
 				}
 
@@ -476,17 +579,17 @@ func WatchPredicateForNonCRDObject(owner runtime.Object, scheme *runtime.Scheme)
 				logger.Debugf("object %q matched on update", objectName)
 
 				// CONFIGMAP WHITELIST
-				// Only reconcile on rook-config-override CM changes
-				isCMTConfigOverride := isCMTConfigOverride(e.ObjectNew)
-				if isCMTConfigOverride {
-					logger.Debugf("do reconcile when the cm is %s", k8sutil.ConfigOverrideName)
+				// Only reconcile on rook-config-override CM changes if the configmap changed
+				shouldReconcileCM := shouldReconcileCM(e.ObjectOld, e.ObjectNew)
+				if shouldReconcileCM {
+					logger.Infof("reconcile due to updated configmap %s", k8sutil.ConfigOverrideName)
 					return true
 				}
 
 				// If the resource is a ConfigMap we don't reconcile
 				_, ok := e.ObjectNew.(*corev1.ConfigMap)
 				if ok {
-					logger.Debugf("do not reconcile on configmap that is not %q", k8sutil.ConfigOverrideName)
+					logger.Debugf("do not reconcile on configmap %q", objectName)
 					return false
 				}
 
@@ -617,15 +720,54 @@ func isCanary(obj runtime.Object) bool {
 	return false
 }
 
-func isCMTConfigOverride(obj runtime.Object) bool {
-	// If not a ConfigMap, let's not reconcile
-	cm, ok := obj.(*corev1.ConfigMap)
+func isCrashCollector(obj runtime.Object) bool {
+	return isDeployment(obj, "rook-ceph-crashcollector")
+}
+
+func isExporter(obj runtime.Object) bool {
+	return isDeployment(obj, "rook-ceph-exporter")
+}
+
+func isDeployment(obj runtime.Object, appName string) bool {
+	// If not a deployment, let's not reconcile
+	d, ok := obj.(*appsv1.Deployment)
 	if !ok {
 		return false
 	}
 
-	objectName := cm.GetName()
-	return objectName == k8sutil.ConfigOverrideName
+	// Get the labels
+	labels := d.GetLabels()
+
+	labelVal, labelKeyExist := labels["app"]
+	if labelKeyExist && labelVal == appName {
+		logger.Debugf("do not reconcile %q on %s", d.Name, appName)
+		return true
+	}
+
+	return false
+}
+
+func shouldReconcileCM(objOld runtime.Object, objNew runtime.Object) bool {
+	// If not a ConfigMap, let's not reconcile
+	cmNew, ok := objNew.(*corev1.ConfigMap)
+	if !ok {
+		return false
+	}
+
+	// If not a ConfigMap, let's not reconcile
+	cmOld, ok := objOld.(*corev1.ConfigMap)
+	if !ok {
+		return false
+	}
+
+	objectName := cmNew.GetName()
+	if objectName != k8sutil.ConfigOverrideName {
+		return false
+	}
+	if !reflect.DeepEqual(cmNew.Data, cmOld.Data) {
+		return true
+	}
+	return false
 }
 
 func isCMToIgnoreOnDelete(obj runtime.Object) bool {
@@ -666,6 +808,48 @@ func IsDoNotReconcile(labels map[string]string) bool {
 
 	// Nothing exists
 	if ok && value == "true" {
+		return true
+	}
+
+	return false
+}
+
+func ReloadManager() {
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Signal(syscall.SIGHUP)
+}
+
+// DuplicateCephClusters determine whether a similar object exists in the same namespace
+// mainly used for the CephCluster which we only support a single instance per namespace
+func DuplicateCephClusters(ctx context.Context, c client.Client, object client.Object, log bool) bool {
+	objectType, ok := object.(*cephv1.CephCluster)
+	if !ok {
+		logger.Errorf("expected type CephCluster but found %T", objectType)
+		return false
+	}
+
+	cephClusterList := &cephv1.CephClusterList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(object.GetNamespace()),
+	}
+	err := c.List(ctx, cephClusterList, listOpts...)
+	if err != nil {
+		logger.Errorf("failed to list ceph clusters, assuming there is none, not reconciling. %v", err)
+		return true
+	}
+
+	logger.Debugf("found %d ceph clusters in namespace %q", len(cephClusterList.Items), object.GetNamespace())
+
+	// This check is needed when the operator is down and a cluster was created
+	if len(cephClusterList.Items) > 1 {
+		// Since multiple predicate are using this function we don't want all of them to log the
+		// same message, so one predicate can log and the other cannot
+		if log {
+			logger.Errorf("found more than one ceph cluster in namespace %q. not reconciling. only one ceph cluster per namespace.", object.GetNamespace())
+			for _, cluster := range cephClusterList.Items {
+				logger.Errorf("found ceph cluster %q in namespace %q", cluster.Name, cluster.Namespace)
+			}
+		}
 		return true
 	}
 
