@@ -24,7 +24,6 @@ import (
 	"github.com/rook/rook/tests/framework/clients"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -50,10 +49,6 @@ const (
 // - Create the object store via the CRD
 // *************************************************************
 func TestCephMultiClusterDeploySuite(t *testing.T) {
-	if installer.SkipTestSuite(installer.CephTestSuite) {
-		t.Skip()
-	}
-
 	s := new(MultiClusterDeploySuite)
 	defer func(s *MultiClusterDeploySuite) {
 		HandlePanics(recover(), s.TearDownSuite, s.T)
@@ -78,17 +73,16 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 	s.poolName = "multi-cluster-pool1"
 	coreNamespace := "multi-core"
 	s.settings = &installer.TestCephSettings{
-		ClusterName:               "multi-cluster",
-		Namespace:                 coreNamespace,
-		OperatorNamespace:         installer.SystemNamespace(coreNamespace),
-		StorageClassName:          "manual",
-		UsePVC:                    installer.UsePVC(),
-		Mons:                      1,
-		UseCSI:                    true,
-		MultipleMgrs:              true,
-		EnableAdmissionController: true,
-		RookVersion:               installer.VersionMaster,
-		CephVersion:               installer.NautilusVersion,
+		ClusterName:       "multi-cluster",
+		Namespace:         coreNamespace,
+		OperatorNamespace: installer.SystemNamespace(coreNamespace),
+		StorageClassName:  "manual",
+		UsePVC:            installer.UsePVC(),
+		Mons:              1,
+		MultipleMgrs:      true,
+		RookVersion:       installer.LocalBuildTag,
+		CephVersion:       installer.SquidVersion,
+		RequireMsgr2:      true,
 	}
 	s.settings.ApplyEnvVars()
 	externalSettings := &installer.TestCephSettings{
@@ -97,16 +91,10 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 		Namespace:         "multi-external",
 		OperatorNamespace: s.settings.OperatorNamespace,
 		RookVersion:       s.settings.RookVersion,
-		UseCSI:            true,
+		CephVersion:       installer.SquidVersion,
 	}
 	externalSettings.ApplyEnvVars()
 	s.externalManifests = installer.NewCephManifests(externalSettings)
-
-	k8sh, err := utils.CreateK8sHelper(s.T)
-	assert.NoError(s.T(), err)
-	if !k8sh.VersionAtLeast("v1.16.0") {
-		s.T().Skip("requires at least k8s 1.16, no need to run on older versions")
-	}
 
 	// Start the core storage cluster
 	s.setupMultiClusterCore()
@@ -132,7 +120,7 @@ func (s *MultiClusterDeploySuite) createPools() {
 
 func (s *MultiClusterDeploySuite) deletePools() {
 	// create a test pool in each cluster so that we get some PGs
-	clusterInfo := client.AdminClusterInfo(s.settings.Namespace)
+	clusterInfo := client.AdminTestClusterInfo(s.settings.Namespace)
 	if err := s.testClient.PoolClient.DeletePool(s.testClient.BlockClient, clusterInfo, s.poolName); err != nil {
 		logger.Errorf("failed to delete pool %q. %v", s.poolName, err)
 	} else {
@@ -142,20 +130,20 @@ func (s *MultiClusterDeploySuite) deletePools() {
 
 func (s *MultiClusterDeploySuite) TearDownSuite() {
 	s.deletePools()
-	s.installer.UninstallRookFromMultipleNS(s.installer.Manifests, s.externalManifests)
+	s.installer.UninstallRookFromMultipleNS(s.externalManifests, s.installer.Manifests)
 }
 
 // Test to make sure all rook components are installed and Running
 func (s *MultiClusterDeploySuite) TestInstallingMultipleRookClusters() {
 	// Check if Rook cluster 1 is deployed successfully
 	client.RunAllCephCommandsInToolboxPod = s.coreToolbox
-	checkIfRookClusterIsInstalled(s.Suite, s.k8sh, s.settings.OperatorNamespace, s.settings.Namespace, 1)
-	checkIfRookClusterIsHealthy(s.Suite, s.testClient, s.settings.Namespace)
+	checkIfRookClusterIsInstalled(&s.Suite, s.k8sh, s.settings.OperatorNamespace, s.settings.Namespace, 1)
+	checkIfRookClusterIsHealthy(&s.Suite, s.testClient, s.settings.Namespace)
 
 	// Check if Rook external cluster is deployed successfully
 	// Checking health status is enough to validate the connection
 	client.RunAllCephCommandsInToolboxPod = s.externalToolbox
-	checkIfRookClusterIsHealthy(s.Suite, s.testClient, s.externalManifests.Settings().Namespace)
+	checkIfRookClusterIsHealthy(&s.Suite, s.testClient, s.externalManifests.Settings().Namespace)
 }
 
 // Setup is wrapper for setting up multiple rook clusters.
@@ -167,7 +155,7 @@ func (s *MultiClusterDeploySuite) setupMultiClusterCore() {
 	cmdOut := utils.ExecuteCommand(cmdArgs)
 	require.NoError(s.T(), cmdOut.Err)
 
-	s.installer, s.k8sh = StartTestCluster(s.T, s.settings, multiClusterMinimalTestVersion)
+	s.installer, s.k8sh = StartTestCluster(s.T, s.settings)
 	s.testClient = clients.CreateTestClient(s.k8sh, s.installer.Manifests)
 	s.coreToolbox = client.RunAllCephCommandsInToolboxPod
 }

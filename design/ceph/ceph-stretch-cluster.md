@@ -12,7 +12,7 @@ For environments that only have two failure domains available where data can be 
 also support the case where one failure domain is lost and the data is still fully available in the
 remaining failure domain.
 
-To support this scenario, Ceph has recently integrated support for stretch clusters with an arbiter mon
+To support this scenario, Ceph has integrated support for stretch clusters with an arbiter mon
 as seen in [this PR](https://github.com/ceph/ceph/pull/35906) and in the following design docs:
 - [Stretch clusters](https://github.com/ceph/ceph/blob/master/doc/rados/operations/stretch-mode.rst)
 - Mon election [strategies](https://github.com/ceph/ceph/blob/master/doc/rados/operations/change-mon-elections.rst) and [design](https://github.com/ceph/ceph/blob/master/doc/dev/mon-elections.rst)
@@ -54,7 +54,7 @@ The topology of the K8s cluster is to be determined by the admin, outside the sc
 Rook will simply detect the topology labels that have been added to the nodes.
 
 If the desired failure domain is a "zone", the `topology.kubernetes.io/zone` label should
-be added to the nodes. Any of the [topology labels](https://rook.io/docs/rook/master/ceph-cluster-crd.html#osd-topology)
+be added to the nodes. Any of the [topology labels](https://rook.io/docs/rook/latest/ceph-cluster-crd.html#osd-topology)
 supported by OSDs can be used.
 
 In the minimum configuration, two nodes in each data zone would be labeled, while one
@@ -89,7 +89,7 @@ three zones must be listed and the arbiter zone is identified.
     stretchCluster:
       # The cluster is most commonly stretched over zones, but could also be stretched over
       # another failure domain such as datacenter or region. Must be one of the labels
-      # used by OSDs as documented at https://rook.io/docs/rook/master/ceph-cluster-crd.html#osd-topology.
+      # used by OSDs as documented at https://rook.io/docs/rook/latest/ceph-cluster-crd.html#osd-topology.
       failureDomainLabel: topology.kubernetes.io/zone
       zones:
       # There must be exactly three zones in this list, with one of them being the arbiter

@@ -17,13 +17,6 @@
 
 override GOOS=linux
 
-ifeq ($(origin DOCKERCMD),undefined)
-DOCKERCMD?=$(shell docker version >/dev/null 2>&1 && echo docker)
-ifeq ($(DOCKERCMD),)
-DOCKERCMD=$(shell podman version >/dev/null 2>&1 && echo podman)
-endif
-endif
-
 # include the common make file
 SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 include $(SELF_DIR)/../build/makelib/common.mk
@@ -31,15 +24,10 @@ include $(SELF_DIR)/../build/makelib/common.mk
 # the registry used for cached images
 CACHE_REGISTRY := cache
 
-# the base image to use
-OSBASE ?= centos:7
-
 ifeq ($(GOARCH),amd64)
 PLATFORM_ARCH = x86_64
-OSBASEIMAGE = $(OSBASE)
 else ifeq ($(GOARCH),arm64)
 PLATFORM_ARCH = aarch64
-OSBASEIMAGE = arm64v8/$(OSBASE)
 else
 $(error Unknown go architecture $(GOARCH))
 endif
@@ -111,7 +99,7 @@ clean.build:
 # Caching
 #
 
-# NOTE: in order to reduce built time especially on jenkins, we maintain a cache
+# NOTE: in order to reduce built time, we maintain a cache
 # of already built images. This cache contains images that can be used to help speed
 # future docker build commands using docker's content addressable schemes. And also
 # to avoid running builds like ceph when the contents have not changed.

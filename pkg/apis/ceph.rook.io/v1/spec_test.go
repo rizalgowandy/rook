@@ -20,9 +20,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/ghodss/yaml"
-	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
 func TestClusterSpecMarshal(t *testing.T) {
@@ -41,7 +40,6 @@ storage:
   location: "region=us-west,datacenter=delmar"
   config:
     metadataDevice: "nvme01"
-    journalSizeMB: "1024"
     databaseSizeMB: "1024"
   nodes:
   - name: "node2"
@@ -49,7 +47,7 @@ storage:
     devicePathFilter: "^/dev/disk/by-id/.*foo.*"`)
 
 	// convert the raw spec yaml into JSON
-	rawJSON, err := yaml.YAMLToJSON(specYaml)
+	rawJSON, err := yaml.ToJSON(specYaml)
 	assert.Nil(t, err)
 	fmt.Printf("rawJSON: %s\n", string(rawJSON))
 
@@ -69,22 +67,21 @@ storage:
 		Network: NetworkSpec{
 			HostNetwork: true,
 		},
-		Storage: rookv1.StorageScopeSpec{
+		Storage: StorageScopeSpec{
 			UseAllNodes: false,
-			Selection: rookv1.Selection{
+			Selection: Selection{
 				UseAllDevices:    &useAllDevices,
 				DeviceFilter:     "^sd.",
 				DevicePathFilter: "^/dev/disk/by-path/pci-.*",
 			},
 			Config: map[string]string{
 				"metadataDevice": "nvme01",
-				"journalSizeMB":  "1024",
 				"databaseSizeMB": "1024",
 			},
-			Nodes: []rookv1.Node{
+			Nodes: []Node{
 				{
 					Name: "node2",
-					Selection: rookv1.Selection{
+					Selection: Selection{
 						DeviceFilter:     "^foo*",
 						DevicePathFilter: "^/dev/disk/by-id/.*foo.*",
 					},
@@ -94,4 +91,79 @@ storage:
 	}
 
 	assert.Equal(t, expectedSpec, clusterSpec)
+}
+
+func newTrue() *bool {
+	t := true
+	return &t
+}
+
+func newFalse() *bool {
+	t := false
+	return &t
+}
+
+func newInt(val int) *int {
+	return &val
+}
+
+func newString(val string) *string {
+	return &val
+}
+
+func TestObjectStoreSpecMarshalSwiftAndKeystone(t *testing.T) {
+	// Assert that the new ObjectStoreSpec fields specified in <design/ceph/object/swift-and-keystone-integration.md> are correctly parsed
+	specYaml := []byte(`
+auth:
+  keystone:
+    url: https://keystone:5000/
+    acceptedRoles: ["_member_", "service", "admin"]
+    implicitTenants: swift
+    tokenCacheSize: 1000
+    revocationInterval: 1200
+    serviceUserSecretName: rgw-service-user
+protocols:
+  swift:
+    accountInUrl: true
+    urlPrefix: /example
+    versioningEnabled: false
+  s3:
+    enabled: false
+    authUseKeystone: true
+`)
+	rawJSON, err := yaml.ToJSON(specYaml)
+	assert.Nil(t, err)
+	fmt.Printf("rawJSON: %s\n", string(rawJSON))
+
+	// unmarshal the JSON into a strongly typed storage spec object
+	var objectStoreSpec ObjectStoreSpec
+	err = json.Unmarshal(rawJSON, &objectStoreSpec)
+	assert.Nil(t, err)
+
+	// the unmarshalled storage spec should equal the expected spec below
+	expectedSpec := ObjectStoreSpec{
+		Auth: AuthSpec{
+			Keystone: &KeystoneSpec{
+				Url:                   "https://keystone:5000/",
+				AcceptedRoles:         []string{"_member_", "service", "admin"},
+				ImplicitTenants:       "swift",
+				TokenCacheSize:        newInt(1000),
+				RevocationInterval:    newInt(1200),
+				ServiceUserSecretName: "rgw-service-user",
+			},
+		},
+		Protocols: ProtocolSpec{
+			S3: &S3Spec{
+				Enabled:         newFalse(),
+				AuthUseKeystone: newTrue(),
+			},
+			Swift: &SwiftSpec{
+				AccountInUrl:      newTrue(),
+				UrlPrefix:         newString("/example"),
+				VersioningEnabled: newFalse(),
+			},
+		},
+	}
+
+	assert.Equal(t, expectedSpec, objectStoreSpec)
 }

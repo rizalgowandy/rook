@@ -26,6 +26,7 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/util"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 const (
@@ -37,14 +38,15 @@ const (
 var (
 	// we don't perform any checks on these daemons
 	// they don't have any "ok-to-stop" command implemented
-	daemonNoCheck = []string{"mgr", "rgw", "rbd-mirror", "nfs", "fs-mirror"}
+	daemonNoCheck    = []string{"mgr", "rgw", "rbd-mirror", "nfs", "fs-mirror"}
+	errNoHostInCRUSH = errors.New("no host in crush map yet?")
 )
 
 func getCephMonVersionString(context *clusterd.Context, clusterInfo *ClusterInfo) (string, error) {
 	args := []string{"version"}
 	buf, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
-		return "", errors.Wrap(err, "failed to run 'ceph version'")
+		return "", errors.Wrapf(err, "failed to run 'ceph version'. %s", string(buf))
 	}
 	output := string(buf)
 	logger.Debug(output)
@@ -97,20 +99,6 @@ func GetAllCephDaemonVersions(context *clusterd.Context, clusterInfo *ClusterInf
 	return &cephVersionsResult, nil
 }
 
-// EnableMessenger2 enable the messenger 2 protocol on Nautilus clusters
-func EnableMessenger2(context *clusterd.Context, clusterInfo *ClusterInfo) error {
-	args := []string{"mon", "enable-msgr2"}
-	buf, err := NewCephCommand(context, clusterInfo, args).Run()
-	if err != nil {
-		return errors.Wrap(err, "failed to enable msgr2 protocol")
-	}
-	output := string(buf)
-	logger.Debug(output)
-	logger.Infof("successfully enabled msgr2 protocol")
-
-	return nil
-}
-
 // EnableReleaseOSDFunctionality disallows pre-Nautilus OSDs and enables all new Nautilus-only functionality
 func EnableReleaseOSDFunctionality(context *clusterd.Context, clusterInfo *ClusterInfo, release string) error {
 	args := []string{"osd", "require-osd-release", release}
@@ -142,12 +130,12 @@ func OkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, d
 			// now trying to parse and find how many mons are presents
 			// if we have less than 3 mons we skip the check and do best-effort
 			// we do less than 3 because during the initial bootstrap the mon sequence is updated too
-			// so running running the check on 2/3 mon fails
-			// versions.Mon looks like this map[ceph version 15.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) octopus (dev):1]
+			// so running the check on 2/3 mon fails
+			// versions.Mon looks like this map[ceph version 19.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) squid (dev):1]
 			// now looping over a single element since we can't address the key directly (we don't know its name)
 			for _, monCount := range versions.Mon {
 				if monCount < 3 {
-					logger.Infof("the cluster has less than 3 monitors, not performing upgrade check, running in best-effort")
+					logger.Infof("the cluster has fewer than 3 monitors, not performing upgrade check, running in best-effort")
 					return nil
 				}
 			}
@@ -188,11 +176,11 @@ func OkToContinue(context *clusterd.Context, clusterInfo *ClusterInfo, deploymen
 }
 
 func okToStopDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, daemonType, daemonName string) error {
-	if !StringInSlice(daemonType, daemonNoCheck) {
+	if !sets.NewString(daemonNoCheck...).Has(daemonType) {
 		args := []string{daemonType, "ok-to-stop", daemonName}
 		buf, err := NewCephCommand(context, clusterInfo, args).Run()
 		if err != nil {
-			return errors.Wrapf(err, "deployment %s cannot be stopped", deployment)
+			return errors.Wrapf(err, "deployment %s cannot be stopped. %s", deployment, string(buf))
 		}
 		output := string(buf)
 		logger.Debugf("deployment %s is ok to be updated. %s", deployment, output)
@@ -221,27 +209,17 @@ func okToContinueMDSDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, 
 	return nil
 }
 
-// StringInSlice return whether an element is in a slice
-func StringInSlice(a string, list []string) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
-}
-
 // LeastUptodateDaemonVersion returns the ceph version of the least updated daemon type
 // So if we invoke this method function with "mon", it will look for the least recent version
 // Assume the following:
 //
-// "mon": {
-//     "ceph version 13.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) mimic (stable)": 1,
-//     "ceph version 14.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) nautilus (stable)": 2
-// }
+//	"mon": {
+//	    "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+//	    "ceph version 19.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) squid (stable)": 1
+//	}
 //
-// In the case we will pick: "ceph version 13.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) mimic (stable)": 1,
-// And eventually return 13.2.5
+// In the case we will pick: "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+// And eventually return 18.2.5
 func LeastUptodateDaemonVersion(context *clusterd.Context, clusterInfo *ClusterInfo, daemonType string) (cephver.CephVersion, error) {
 	var r map[string]int
 	var vv cephver.CephVersion
@@ -311,7 +289,7 @@ func allOSDsSameHost(context *clusterd.Context, clusterInfo *ClusterInfo) (bool,
 
 	hostOsdNodes := len(hostOsdTree.Nodes)
 	if hostOsdNodes == 0 {
-		return false, errors.New("no host in crush map yet?")
+		return false, errNoHostInCRUSH
 	}
 
 	// If the number of OSD node is 1, chances are this is simple setup with all OSDs on it
@@ -366,17 +344,6 @@ func OSDUpdateShouldCheckOkToStop(context *clusterd.Context, clusterInfo *Cluste
 		return false
 	}
 
-	// aio means all in one
-	aio, err := allOSDsSameHost(context, clusterInfo)
-	if err != nil {
-		logger.Warningf("failed to determine if all osds are running on the same host. will check if OSDs are ok-to-stop. if all OSDs are running on one host %s. %v", userIntervention, err)
-		return true
-	}
-	if aio {
-		logger.Warningf("all OSDs are running on the same host. not performing upgrade check. running in best-effort")
-		return false
-	}
-
 	return true
 }
 
@@ -394,13 +361,25 @@ func osdDoNothing(context *clusterd.Context, clusterInfo *ClusterInfo) bool {
 		return false
 	}
 	if len(osds) < 3 {
-		logger.Warningf("the cluster has less than 3 osds, not performing upgrade check, running in best-effort")
+		logger.Warningf("the cluster has fewer than 3 osds, not performing upgrade check, running in best-effort")
 		return true
 	}
 
 	// aio means all in one
 	aio, err := allOSDsSameHost(context, clusterInfo)
 	if err != nil {
+		// We return true so that we can continue without a retry and subsequently not test if the
+		// osd can be stopped This handles the scenario where the OSDs have been created but not yet
+		// started due to a wrong CR configuration For instance, when OSDs are encrypted and Vault
+		// is used to store encryption keys, if the KV version is incorrect during the cluster
+		// initialization the OSDs will fail to start and stay in CLBO until the CR is updated again
+		// with the correct KV version so that it can start For this scenario we don't need to go
+		// through the path where the check whether the OSD can be stopped or not, so it will always
+		// fail and make us wait for nothing
+		if errors.Is(err, errNoHostInCRUSH) {
+			logger.Warning("the CRUSH map has no 'host' entries so not performing ok-to-stop checks")
+			return true
+		}
 		logger.Warningf("failed to determine if all osds are running on the same host, performing upgrade check anyways. %v", err)
 		return false
 	}

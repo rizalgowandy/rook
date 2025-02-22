@@ -17,31 +17,30 @@ limitations under the License.
 package clusterdisruption
 
 import (
-	"context"
-
 	"github.com/pkg/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func (r *ReconcileClusterDisruption) createStaticPDB(pdb *policyv1beta1.PodDisruptionBudget) error {
-	err := r.client.Create(context.TODO(), pdb)
+func (r *ReconcileClusterDisruption) createStaticPDB(pdb client.Object) error {
+	err := r.client.Create(r.context.OpManagerContext, pdb)
 	if err != nil {
-		return errors.Wrapf(err, "failed to create pdb %q", pdb.Name)
+		return errors.Wrapf(err, "failed to create pdb %q", pdb.GetName())
 	}
 	return nil
 }
 
-func (r *ReconcileClusterDisruption) reconcileStaticPDB(request types.NamespacedName, pdb *policyv1beta1.PodDisruptionBudget) error {
-	existingPDB := &policyv1beta1.PodDisruptionBudget{}
-	err := r.client.Get(context.TODO(), request, existingPDB)
+func (r *ReconcileClusterDisruption) reconcileStaticPDB(request types.NamespacedName, pdb client.Object) error {
+	existingPDB := &policyv1.PodDisruptionBudget{}
+	err := r.client.Get(r.context.OpManagerContext, request, existingPDB)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.createStaticPDB(pdb)
 		}
-		return errors.Wrapf(err, "failed to get pdb %q", pdb.Name)
+		return errors.Wrapf(err, "failed to get pdb %q", pdb.GetName())
 	}
 
 	return nil

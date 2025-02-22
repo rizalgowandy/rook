@@ -18,11 +18,11 @@ package mon
 
 import (
 	"context"
-	"sync"
 	"testing"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
@@ -32,25 +32,26 @@ import (
 func TestCreateService(t *testing.T) {
 	ctx := context.TODO()
 	clientset := test.New(t, 1)
-	c := New(&clusterd.Context{Clientset: clientset}, "ns", cephv1.ClusterSpec{}, &k8sutil.OwnerInfo{}, &sync.Mutex{})
+	c := New(ctx, &clusterd.Context{Clientset: clientset}, "ns", cephv1.ClusterSpec{}, &k8sutil.OwnerInfo{})
+	c.ClusterInfo = client.AdminTestClusterInfo("rook-ceph")
 	m := &monConfig{ResourceName: "rook-ceph-mon-b", DaemonName: "b"}
-	clusterIP, err := c.createService(m)
+	service, err := c.createService(m)
 	assert.NoError(t, err)
 	// the clusterIP will not be set in a mock service
-	assert.Equal(t, "", clusterIP)
+	assert.Equal(t, "", service.Spec.ClusterIP)
 
 	m.PublicIP = "1.2.3.4"
-	clusterIP, err = c.createService(m)
+	service, err = c.createService(m)
 	assert.NoError(t, err)
 	// the clusterIP will not be set in the mock because the service already exists
-	assert.Equal(t, "", clusterIP)
+	assert.Equal(t, "", service.Spec.ClusterIP)
 
 	// delete the service to mock a disaster recovery scenario
 	err = clientset.CoreV1().Services(c.Namespace).Delete(ctx, m.ResourceName, metav1.DeleteOptions{})
 	assert.NoError(t, err)
 
-	clusterIP, err = c.createService(m)
+	service, err = c.createService(m)
 	assert.NoError(t, err)
 	// the clusterIP will now be set to the expected value
-	assert.Equal(t, m.PublicIP, clusterIP)
+	assert.Equal(t, m.PublicIP, service.Spec.ClusterIP)
 }

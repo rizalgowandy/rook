@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
@@ -41,8 +42,8 @@ func TestMonStore_Set(t *testing.T) {
 	// us to cause it to return an error when it detects a keyword.
 	execedCmd := ""
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -50,7 +51,7 @@ func TestMonStore_Set(t *testing.T) {
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// setting with spaces converts to underscores
 	e := monStore.Set("global", "debug ms", "10")
@@ -86,8 +87,8 @@ func TestMonStore_Delete(t *testing.T) {
 	// us to cause it to return an error when it detects a keyword.
 	execedCmd := ""
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -95,7 +96,7 @@ func TestMonStore_Delete(t *testing.T) {
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config rm called as expected
 	e := monStore.Delete("global", "debug ms")
@@ -125,8 +126,8 @@ func TestMonStore_GetDaemon(t *testing.T) {
 		"\"rgw_enable_usage_log\":{\"value\":\"true\",\"section\":\"client.rgw.test.a\",\"mask\":{}," +
 		"\"can_update_at_runtime\":true}}"
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -134,7 +135,7 @@ func TestMonStore_GetDaemon(t *testing.T) {
 			return execReturn, nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config get called as expected
 	options, e := monStore.GetDaemon("client.rgw.test.a")
@@ -171,13 +172,13 @@ func TestMonStore_DeleteDaemon(t *testing.T) {
 		"\"can_update_at_runtime\":true}," +
 		"\"rgw_enable_usage_log\":{\"value\":\"true\",\"section\":\"client.rgw.test.a\",\"mask\":{}," +
 		"\"can_update_at_runtime\":true}}"
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			return execReturn, nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config rm rgw_enable_usage_log called as expected
 	e := monStore.DeleteDaemon("client.rgw.test.a")
@@ -195,49 +196,68 @@ func TestMonStore_SetAll(t *testing.T) {
 
 	// create a mock command runner which creates a simple string of the command it ran, and allow
 	// us to cause it to return an error when it detects a keyword.
-	execedCmds := []string{}
-	execInjectErrOnKeyword := "donotinjectanerror"
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
-			execedCmd := command + " " + strings.Join(args, " ")
-			execedCmds = append(execedCmds, execedCmd)
-			k := execInjectErrOnKeyword
-			if strings.Contains(execedCmd, k) {
-				return "output from cmd with error on keyword: " + k, errors.Errorf("mocked error on keyword: " + k)
-			}
+	appliedSettings := false
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
+			appliedSettings = true
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
-	cfgOverrides := []Option{
-		configOverride("global", "debug ms", "10"), // setting w/ spaces converts to underscores
-		configOverride("osd.0", "debug-osd", "20"), // setting w/ dashes converts to underscores
-		configOverride("mds.*", "debug_mds", "15"), // setting w/ underscores remains the same
+	cfgOverrides := map[string]string{
+		"debug ms":  "10", // setting w/ spaces converts to underscores
+		"debug-osd": "20", // setting w/ dashes converts to underscores
+		"debug_mds": "15", // setting w/ underscores remains the same
 	}
 
 	// commands w/ no error
-	e := monStore.SetAll(cfgOverrides...)
+	keys, e := monStore.setAll("osd.0", cfgOverrides)
+	// no keys written since it's mocked
+	assert.Equal(t, 0, len(keys))
 	assert.NoError(t, e)
-	assert.Len(t, execedCmds, 3)
-	assert.Contains(t, execedCmds[0], " global debug_ms 10 ")
-	assert.Contains(t, execedCmds[1], " osd.0 debug_osd 20 ")
-	assert.Contains(t, execedCmds[2], " mds.* debug_mds 15 ")
+	assert.True(t, appliedSettings)
+}
 
-	// commands w/ one error
-	// keep cfgOverrides from last test
-	execInjectErrOnKeyword = "debug_osd"
-	execedCmds = execedCmds[:0] // empty execedCmds slice
-	e = monStore.SetAll(cfgOverrides...)
-	assert.Error(t, e)
-	// Rook should not return error before trying to set all config overrides
-	assert.Len(t, execedCmds, 3)
-
-	// all commands return error
-	// keep cfgOverrides
-	execInjectErrOnKeyword = "debug"
-	execedCmds = execedCmds[:0]
-	e = monStore.SetAll(cfgOverrides...)
-	assert.Error(t, e)
-	assert.Len(t, execedCmds, 3)
+func TestFilterSettingsMap(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    CephConfigOptionsMap
+		expected CephConfigOptionsMap
+	}{
+		{
+			name: "no filtered config options",
+			input: map[string]map[string]string{
+				"global": {
+					"osd_pool_default_size": "1",
+				},
+			},
+			expected: map[string]map[string]string{
+				"global": {
+					"osd_pool_default_size": "1",
+				},
+			},
+		},
+		{
+			name: "filtered config options",
+			input: map[string]map[string]string{
+				"global": {
+					"mon_host":              "192.168.1.100:687",
+					"osd_pool_default_size": "1",
+					"bluefs_buffered_io":    "false",
+				},
+			},
+			expected: map[string]map[string]string{
+				"global": {
+					"osd_pool_default_size": "1",
+					"bluefs_buffered_io":    "false",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, filterSettingsMap(tt.input))
+		})
+	}
 }

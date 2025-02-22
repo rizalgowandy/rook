@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,8 @@ limitations under the License.
 package v1
 
 import (
+	"net/http"
+
 	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
@@ -27,10 +29,15 @@ import (
 type CephV1Interface interface {
 	RESTClient() rest.Interface
 	CephBlockPoolsGetter
+	CephBlockPoolRadosNamespacesGetter
+	CephBucketNotificationsGetter
+	CephBucketTopicsGetter
+	CephCOSIDriversGetter
 	CephClientsGetter
 	CephClustersGetter
 	CephFilesystemsGetter
 	CephFilesystemMirrorsGetter
+	CephFilesystemSubVolumeGroupsGetter
 	CephNFSesGetter
 	CephObjectRealmsGetter
 	CephObjectStoresGetter
@@ -49,6 +56,22 @@ func (c *CephV1Client) CephBlockPools(namespace string) CephBlockPoolInterface {
 	return newCephBlockPools(c, namespace)
 }
 
+func (c *CephV1Client) CephBlockPoolRadosNamespaces(namespace string) CephBlockPoolRadosNamespaceInterface {
+	return newCephBlockPoolRadosNamespaces(c, namespace)
+}
+
+func (c *CephV1Client) CephBucketNotifications(namespace string) CephBucketNotificationInterface {
+	return newCephBucketNotifications(c, namespace)
+}
+
+func (c *CephV1Client) CephBucketTopics(namespace string) CephBucketTopicInterface {
+	return newCephBucketTopics(c, namespace)
+}
+
+func (c *CephV1Client) CephCOSIDrivers(namespace string) CephCOSIDriverInterface {
+	return newCephCOSIDrivers(c, namespace)
+}
+
 func (c *CephV1Client) CephClients(namespace string) CephClientInterface {
 	return newCephClients(c, namespace)
 }
@@ -63,6 +86,10 @@ func (c *CephV1Client) CephFilesystems(namespace string) CephFilesystemInterface
 
 func (c *CephV1Client) CephFilesystemMirrors(namespace string) CephFilesystemMirrorInterface {
 	return newCephFilesystemMirrors(c, namespace)
+}
+
+func (c *CephV1Client) CephFilesystemSubVolumeGroups(namespace string) CephFilesystemSubVolumeGroupInterface {
+	return newCephFilesystemSubVolumeGroups(c, namespace)
 }
 
 func (c *CephV1Client) CephNFSes(namespace string) CephNFSInterface {
@@ -94,12 +121,28 @@ func (c *CephV1Client) CephRBDMirrors(namespace string) CephRBDMirrorInterface {
 }
 
 // NewForConfig creates a new CephV1Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*CephV1Client, error) {
 	config := *c
 	if err := setConfigDefaults(&config); err != nil {
 		return nil, err
 	}
-	client, err := rest.RESTClientFor(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
+	if err != nil {
+		return nil, err
+	}
+	return NewForConfigAndClient(&config, httpClient)
+}
+
+// NewForConfigAndClient creates a new CephV1Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*CephV1Client, error) {
+	config := *c
+	if err := setConfigDefaults(&config); err != nil {
+		return nil, err
+	}
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
 	}

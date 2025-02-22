@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +20,14 @@ package v1
 
 type CephBlockPoolExpansion interface{}
 
+type CephBlockPoolRadosNamespaceExpansion interface{}
+
+type CephBucketNotificationExpansion interface{}
+
+type CephBucketTopicExpansion interface{}
+
+type CephCOSIDriverExpansion interface{}
+
 type CephClientExpansion interface{}
 
 type CephClusterExpansion interface{}
@@ -27,6 +35,8 @@ type CephClusterExpansion interface{}
 type CephFilesystemExpansion interface{}
 
 type CephFilesystemMirrorExpansion interface{}
+
+type CephFilesystemSubVolumeGroupExpansion interface{}
 
 type CephNFSExpansion interface{}
 

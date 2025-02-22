@@ -1,3 +1,3 @@
 # Rook Feature Proposal
 
-Please follow the [design section guideline](https://rook.io/docs/rook/master/development-flow.html#design-document).
+Please follow the [design section guideline](https://rook.io/docs/rook/v1.9/Contributing/development-flow/#design-document).

@@ -17,8 +17,10 @@ limitations under the License.
 package rook
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/coreos/pkg/capnslog"
@@ -27,17 +29,23 @@ import (
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util"
 	"github.com/rook/rook/pkg/util/exec"
 	"github.com/rook/rook/pkg/util/flags"
 	"github.com/rook/rook/pkg/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/tevino/abool"
+	zaplogfmt "github.com/sykesm/zap-logfmt"
+	uzap "go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	v1 "k8s.io/api/core/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 const (
@@ -46,44 +54,55 @@ const (
 )
 
 var RootCmd = &cobra.Command{
-	Use: "rook",
+	Use:    "rook",
+	Short:  "Rook (rook.io) Kubernetes operator and user tools",
+	Hidden: false,
 }
 
 var (
-	logLevelRaw        string
-	operatorImage      string
-	serviceAccountName string
-	Cfg                = &Config{}
-	logger             = capnslog.NewPackageLogger("github.com/rook/rook", "rookcmd")
+	logLevelRaw string
+	logger      = capnslog.NewPackageLogger("github.com/rook/rook", "rookcmd")
 )
 
-type Config struct {
-	LogLevel capnslog.LogLevel
-}
-
 // Initialize the configuration parameters. The precedence from lowest to highest is:
-//  1) default value (at compilation)
-//  2) environment variables (upper case, replace - with _, and rook prefix. For example, discovery-url is ROOK_DISCOVERY_URL)
-//  3) command line parameter
+//  1. default value (at compilation)
+//  2. environment variables (upper case, replace - with _, and rook prefix. For example, discovery-url is ROOK_DISCOVERY_URL)
+//  3. command line parameter
 func init() {
-	RootCmd.PersistentFlags().StringVar(&logLevelRaw, "log-level", "INFO", "logging level for logging/tracing output (valid values: CRITICAL,ERROR,WARNING,NOTICE,INFO,DEBUG,TRACE)")
-	RootCmd.PersistentFlags().StringVar(&operatorImage, "operator-image", "", "Override the image url that the operator uses. The default is read from the operator pod.")
-	RootCmd.PersistentFlags().StringVar(&serviceAccountName, "service-account", "", "Override the service account that the operator uses. The default is read from the operator pod.")
+	RootCmd.PersistentFlags().StringVar(&logLevelRaw, "log-level", "INFO", "logging level for logging/tracing output (valid values: ERROR,WARNING,INFO,DEBUG)")
+	RootCmd.InitDefaultHelpCmd()
+	RootCmd.InitDefaultHelpFlag()
+	RootCmd.InitDefaultCompletionCmd()
 
 	// load the environment variables
 	flags.SetFlagsFromEnv(RootCmd.Flags(), RookEnvVarPrefix)
 	flags.SetFlagsFromEnv(RootCmd.PersistentFlags(), RookEnvVarPrefix)
+
+	// Initialize a logger for the controller runtime
+	leveler := uzap.LevelEnablerFunc(func(level zapcore.Level) bool {
+		// Set the level fairly high since it's so verbose
+		return level >= zapcore.DPanicLevel
+	})
+	stackTraceLeveler := uzap.LevelEnablerFunc(func(level zapcore.Level) bool {
+		// Attempt to suppress the stack traces in the logs since they are so verbose.
+		// The controller runtime seems to ignore this since the stack is still always printed.
+		return false
+	})
+	logfmtEncoder := zaplogfmt.NewEncoder(uzap.NewProductionEncoderConfig())
+	logger := zap.New(
+		zap.Level(leveler),
+		zap.StacktraceLevel(stackTraceLeveler),
+		zap.UseDevMode(false),
+		zap.WriteTo(os.Stdout),
+		zap.Encoder(logfmtEncoder))
+	log.SetLogger(logger)
+	// To disable controller runtime logging, instead set the null logger:
+	//log.SetLogger(logr.New(log.NullLogSink{}))
 }
 
 // SetLogLevel set log level based on provided log option.
 func SetLogLevel() {
-	// parse given log level string then set up corresponding global logging level
-	ll, err := capnslog.ParseLevel(logLevelRaw)
-	if err != nil {
-		logger.Warningf("failed to set log level %s. %+v", logLevelRaw, err)
-	}
-	Cfg.LogLevel = ll
-	capnslog.SetGlobalLogLevel(Cfg.LogLevel)
+	util.SetGlobalLogLevel(logLevelRaw, logger)
 }
 
 // LogStartupInfo log the version number, arguments, and all final flag values (environment variable overrides have already been taken into account)
@@ -99,60 +118,21 @@ func NewContext() *clusterd.Context {
 	var err error
 
 	context := &clusterd.Context{
-		Executor:    &exec.CommandExecutor{},
-		NetworkInfo: clusterd.NetworkInfo{},
-		ConfigDir:   k8sutil.DataDir,
-		LogLevel:    Cfg.LogLevel,
+		Executor:  &exec.CommandExecutor{},
+		ConfigDir: k8sutil.DataDir,
 	}
 
 	// Try to read config from in-cluster env
 	context.KubeConfig, err = rest.InClusterConfig()
 	if err != nil {
-
-		// **Not** running inside a cluster - running the operator outside of the cluster.
-		// This mode is for developers running the operator on their dev machines
-		// for faster development, or to run operator cli tools manually to a remote cluster.
-		// We setup the API server config from default user file locations (most notably ~/.kube/config),
-		// and also change the executor to work remotely and run kubernetes jobs.
-		logger.Info("setting up the context to outside of the cluster")
-
-		// Try to read config from user config files
-		context.KubeConfig, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			clientcmd.NewDefaultClientConfigLoadingRules(),
-			&clientcmd.ConfigOverrides{}).ClientConfig()
-		TerminateOnError(err, "failed to get k8s config")
-
-		// When running outside, we need to setup an executor that runs the commands as kubernetes jobs.
-		// This allows the operator code to execute tools that are available in the operator image
-		// or just have to be run inside the cluster in order to talk to the pods and services directly.
-		context.Executor = &exec.TranslateCommandExecutor{
-			Executor: context.Executor,
-			Translator: func(
-				command string,
-				arg ...string,
-			) (string, []string) {
-				jobName := "rook-exec-job-" + string(uuid.NewUUID())
-				transCommand := "kubectl"
-				transArgs := append([]string{
-					"run", jobName,
-					"--image=" + operatorImage,
-					"--serviceaccount=" + serviceAccountName,
-					"--restart=Never",
-					"--attach",
-					"--rm",
-					"--quiet",
-					"--command", "--",
-					command}, arg...)
-				return transCommand, transArgs
-			},
-		}
+		TerminateOnError(err, "failed to get k8s cluster config")
 	}
 
 	context.Clientset, err = kubernetes.NewForConfig(context.KubeConfig)
 	TerminateOnError(err, "failed to create k8s clientset")
 
-	context.APIExtensionClientset, err = apiextensionsclient.NewForConfig(context.KubeConfig)
-	TerminateOnError(err, "failed to create k8s API extension clientset")
+	context.RemoteExecutor.ClientSet = context.Clientset
+	context.RemoteExecutor.RestClient = context.KubeConfig
 
 	context.RookClientset, err = rookclient.NewForConfig(context.KubeConfig)
 	TerminateOnError(err, "failed to create rook clientset")
@@ -160,20 +140,15 @@ func NewContext() *clusterd.Context {
 	context.NetworkClient, err = netclient.NewForConfig(context.KubeConfig)
 	TerminateOnError(err, "failed to create network clientset")
 
-	context.RequestCancelOrchestration = abool.New()
+	context.ApiExtensionsClient, err = apiextensionsclient.NewForConfig(context.KubeConfig)
+	TerminateOnError(err, "failed to create crd extensions client")
 
 	return context
 }
 
-func GetOperatorImage(clientset kubernetes.Interface, containerName string) string {
-
-	// If provided as a flag then use that value
-	if operatorImage != "" {
-		return operatorImage
-	}
-
+func GetOperatorImage(ctx context.Context, clientset kubernetes.Interface, containerName string) string {
 	// Getting the info of the operator pod
-	pod, err := k8sutil.GetRunningPod(clientset)
+	pod, err := k8sutil.GetRunningPod(ctx, clientset)
 	TerminateOnError(err, "failed to get pod")
 
 	// Get the actual operator container image name
@@ -183,18 +158,23 @@ func GetOperatorImage(clientset kubernetes.Interface, containerName string) stri
 	return containerImage
 }
 
-func GetOperatorServiceAccount(clientset kubernetes.Interface) string {
-
-	// If provided as a flag then use that value
-	if serviceAccountName != "" {
-		return serviceAccountName
-	}
-
+func GetOperatorServiceAccount(ctx context.Context, clientset kubernetes.Interface) string {
 	// Getting the info of the operator pod
-	pod, err := k8sutil.GetRunningPod(clientset)
+	pod, err := k8sutil.GetRunningPod(ctx, clientset)
 	TerminateOnError(err, "failed to get pod")
 
 	return pod.Spec.ServiceAccountName
+}
+
+func CheckOperatorResources(ctx context.Context, clientset kubernetes.Interface) {
+	// Getting the info of the operator pod
+	pod, err := k8sutil.GetRunningPod(ctx, clientset)
+	TerminateOnError(err, "failed to get pod")
+	resource := pod.Spec.Containers[0].Resources
+	// set env var if operator pod resources are set
+	if !reflect.DeepEqual(resource, (v1.ResourceRequirements{})) {
+		os.Setenv("OPERATOR_RESOURCES_SPECIFIED", "true")
+	}
 }
 
 // TerminateOnError terminates if err is not nil
@@ -207,23 +187,21 @@ func TerminateOnError(err error, msg string) {
 // TerminateFatal terminates the process with an exit code of 1
 // and writes the given reason to stderr and the termination log file.
 func TerminateFatal(reason error) {
-	fmt.Fprintln(os.Stderr, reason)
-
 	file, err := os.OpenFile(terminationLog, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, fmt.Errorf("failed to write message to termination log: %+v", err))
+		fmt.Fprintln(os.Stderr, fmt.Errorf("failed to write message to termination log: %v", err))
 	} else {
-		// #nosec G307 Calling defer to close the file without checking the error return is not a risk for a simple file open and close
+		//nolint:gosec // Calling defer to close the file without checking the error return is not a risk for a simple file open and close
 		defer file.Close()
 		if _, err = file.WriteString(reason.Error()); err != nil {
-			fmt.Fprintln(os.Stderr, fmt.Errorf("failed to write message to termination log: %+v", err))
+			fmt.Fprintln(os.Stderr, fmt.Errorf("failed to write message to termination log: %v", err))
 		}
 		if err := file.Close(); err != nil {
-			logger.Errorf("failed to close file. %v", err)
+			logger.Fatalf("failed to close file. %v", err)
 		}
 	}
 
-	os.Exit(1)
+	logger.Fatalln(reason)
 }
 
 // GetOperatorBaseImageCephVersion returns the Ceph version of the operator image
@@ -234,4 +212,59 @@ func GetOperatorBaseImageCephVersion(context *clusterd.Context) (string, error) 
 	}
 
 	return output, nil
+}
+
+// GetInternalOrExternalClient will get a Kubernetes client interface from the KUBECONFIG variable
+// if it is set, or from the operator pod environment otherwise.
+func GetInternalOrExternalClient() kubernetes.Interface {
+	var restConfig *rest.Config
+	var clientset *kubernetes.Clientset
+	var err error
+
+	// if KUBECONFIG env var is present, it is the source of truth
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig != "" {
+		logger.Debugf("attempting to create kube client interface from KUBCONFIG environment variable: %s", kubeconfig)
+		for _, kConf := range strings.Split(kubeconfig, ":") {
+			restConfig, err = clientcmd.BuildConfigFromFlags("", kConf)
+			if err == nil {
+				logger.Debugf("attempting to create kube clientset from kube config file %q", kConf)
+				clientset, err = kubernetes.NewForConfig(restConfig)
+				if err == nil {
+					logger.Infof("created kube client interface from kube config file %q present in KUBECONFIG environment variable", kConf)
+					return clientset
+				}
+			}
+		}
+	}
+	if err != nil {
+		TerminateOnError(err, "could not create kube client interface from KUBECONFIG environment variable: "+kubeconfig+"; "+
+			"if the KUBECONFIG environment variable is incorrect, unset it, or set it to the correct kube config file location")
+	}
+
+	logger.Debug("attempting to create kube client interface using default CLI parameters")
+	defaultConfigFlags := genericclioptions.NewConfigFlags(false)
+	restConfig, err = defaultConfigFlags.ToRESTConfig()
+	if err == nil {
+		clientset, err = kubernetes.NewForConfig(restConfig)
+		if err == nil {
+			logger.Infof("created kube client interface from default CLI parameters")
+			return clientset
+		}
+		logger.Debugf("failed to create kube client interface from default CLI parameters; " +
+			"check the default kube config file location to ensure the proper config is present there")
+	}
+
+	logger.Infof("attempting to create kube client interface assuming the application is running in a Kubernetes Pod; " +
+		"if this tool is not running in a Kubernetes Pod, this is an error: " +
+		"to resolve, ensure there is a kube config file present in the default location, or set the KUBECONFIG environment variable")
+	restConfig, err = rest.InClusterConfig()
+	if err != nil {
+		TerminateOnError(err, "failed to create kube client interface's REST config from Kubernetes Pod environment")
+	}
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		TerminateOnError(err, "failed to create kube client interface from Kubernetes Pod environment")
+	}
+	return client
 }

@@ -16,11 +16,12 @@ limitations under the License.
 package k8sutil
 
 import (
-	"os"
+	"context"
+	"fmt"
 	"testing"
 
-	rookv1 "github.com/rook/rook/pkg/apis/rook.io/v1"
-
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -94,7 +95,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration := newToleration(5, "node.kubernetes.io/unreachable")
 
 	// Change the UR toleration in the pod using env var and the tested function
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "5")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "5")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 1, len(podSpec.Tolerations))
@@ -106,7 +107,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration = newToleration(6, "node.kubernetes.io/unreachable")
 
 	// Change the UR toleration in the pod using env var and the tested function
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "6")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "6")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 1, len(podSpec.Tolerations))
@@ -123,7 +124,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration = newToleration(7, "node.kubernetes.io/unreachable")
 
 	// Change the Unreachable node toleration
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "7")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "7")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 2, len(podSpec.Tolerations))
@@ -137,7 +138,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration = newToleration(8, "node.kubernetes.io/unreachable")
 
 	// Change the Unreachable node toleration
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "8")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "8")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 3, len(podSpec.Tolerations))
@@ -151,7 +152,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration = newToleration(9, "node.kubernetes.io/unreachable")
 
 	// Change the Unreachable node toleration
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "9")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "9")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 2, len(podSpec.Tolerations))
@@ -164,7 +165,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 	expectedURToleration = newToleration(5, "node.kubernetes.io/unreachable")
 
 	// Change the Unreachable node toleration using wrong format
-	os.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "9s")
+	t.Setenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS", "9s")
 	AddUnreachableNodeToleration(&podSpec)
 
 	assert.Equal(t, 1, len(podSpec.Tolerations))
@@ -172,7 +173,7 @@ func TestAddUnreachableNodeToleration(t *testing.T) {
 
 }
 
-func testPodSpecPlacement(t *testing.T, requiredDuringScheduling bool, req, pref int, placement *rookv1.Placement) {
+func testPodSpecPlacement(t *testing.T, requiredDuringScheduling bool, req, pref int, placement *cephv1.Placement) {
 	spec := v1.PodSpec{
 		InitContainers: []v1.Container{},
 		Containers:     []v1.Container{},
@@ -188,8 +189,8 @@ func testPodSpecPlacement(t *testing.T, requiredDuringScheduling bool, req, pref
 		len(spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution))
 }
 
-func makePlacement() rookv1.Placement {
-	return rookv1.Placement{
+func makePlacement() cephv1.Placement {
+	return cephv1.Placement{
 		PodAntiAffinity: &v1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
 				{
@@ -209,7 +210,7 @@ func makePlacement() rookv1.Placement {
 
 func TestPodSpecPlacement(t *testing.T) {
 	// no placement settings in the crd
-	p := rookv1.Placement{}
+	p := cephv1.Placement{}
 	testPodSpecPlacement(t, true, 1, 0, &p)
 	testPodSpecPlacement(t, false, 0, 1, &p)
 	testPodSpecPlacement(t, false, 0, 0, &p)
@@ -219,4 +220,47 @@ func TestPodSpecPlacement(t *testing.T) {
 	testPodSpecPlacement(t, true, 2, 1, &p)
 	p = makePlacement()
 	testPodSpecPlacement(t, false, 1, 2, &p)
+}
+
+func TestIsMonScheduled(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 1)
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mon-pod",
+			Namespace: "ns",
+			Labels: map[string]string{
+				"app":            "rook-ceph-mon",
+				"ceph_daemon_id": "a",
+			},
+		},
+	}
+
+	// no pods running
+	isScheduled, err := IsPodScheduled(ctx, clientset, "ns", "a")
+	assert.Error(t, err)
+	assert.False(t, isScheduled)
+
+	selector := fmt.Sprintf("%s=%s,%s=%s", AppAttr, "rook-ceph-mon", "ceph_daemon_id", "a")
+
+	// unscheduled pod
+	_, err = clientset.CoreV1().Pods("ns").Create(ctx, &pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	isScheduled, err = IsPodScheduled(ctx, clientset, "ns", selector)
+	assert.NoError(t, err)
+	assert.False(t, isScheduled)
+
+	// scheduled pod
+	pod.Spec.NodeName = "node0"
+	_, err = clientset.CoreV1().Pods("ns").Update(ctx, &pod, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+	isScheduled, err = IsPodScheduled(ctx, clientset, "ns", selector)
+	assert.NoError(t, err)
+	assert.True(t, isScheduled)
+
+	// no pods found
+	assert.NoError(t, err)
+	isScheduled, err = IsPodScheduled(ctx, clientset, "ns", "b")
+	assert.Error(t, err)
+	assert.False(t, isScheduled)
 }

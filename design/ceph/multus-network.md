@@ -1,11 +1,11 @@
 # Multus networking integration with Ceph (not finalized yet and subject to update)
 
 We have already explored and explained the benefit of multi-homed networking, so this document will not rehearse that but simply focus on the implementation for the Ceph backend.
-If you are interested in learning more about multi-homed networking you can read the [design documentation on that matter](../core/multi-homed-cluster.md).
+If you are interested in learning more about multi-homed networking you can read the [design documentation on that matter](../common/multi-homed-cluster.md).
 
-To make the story short, [Multus](https://github.com/intel/multus-cni) should allow us to get the same performance benefit as `HostNetworking` by increasing the security.
+To make the story short, [Multus](https://github.com/intel/multus-cni) should allow us to get the same performance benefit as `HostNetworking` as well as increasing the security.
 Using `HostNetworking` results in exposing **all** the network interfaces (the entire stack) of the host inside the container where Multus allows you to pick the one you want.
-Also, this removes the need of privileged containers (required for `HostNetworking`).
+Also, this minimizes the need of privileged containers (required for `HostNetworking`).
 
 ## Proposed CRD changed
 
@@ -78,7 +78,20 @@ Nothing to do in particular since they don't use any service IPs.
 
 ### CSI pods
 
-We can add annotations to these pods and they can reach out the Ceph public network, then the driver will expose the block or the filesystem normally.
+Steps must be taken to fix a CSI-with-multus issue documented
+[here](https://github.com/rook/rook/issues/8085). To summarize the issue:
+when a CephFS/RBD volume is mounted in a pod using Ceph CSI and then the CSI CephFS/RBD plugin is
+restarted or terminated (e.g. by restarting or deleting its DaemonSet), all operations on the volume
+become blocked, even after restarting the CSI pods. The only workaround is to restart the node where
+the Ceph CSI plugin pod was restarted.
+
+When deploying a CephCluster resource configured to use multus networks, a multus-connected network
+interface will be added to the host network namespace for all nodes that will run CSI plugin pods.
+This will allow Ceph CSI pods to run using host networking and still access Ceph's public multus
+network.
+
+The design for mitigating the issue is to add a new DaemonSet that will own the network for all CephFS mounts
+as well as RBD mapped devices. The `csi-{cephfs,rbd}plugin` DaemonSet are left untouched.
 
 ## Accepted proposal
 

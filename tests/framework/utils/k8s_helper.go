@@ -17,12 +17,10 @@ limitations under the License.
 package utils
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"path"
@@ -32,10 +30,12 @@ import (
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
+	bktclient "github.com/kube-object-storage/lib-bucket-provisioner/pkg/client/clientset/versioned"
 	"github.com/pkg/errors"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/util/exec"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -43,16 +43,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	storagev1util "k8s.io/kubernetes/pkg/apis/storage/v1/util"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 // K8sHelper is a helper for common kubectl commands
 type K8sHelper struct {
 	executor         *exec.CommandExecutor
+	remoteExecutor   *exec.RemotePodCommandExecutor
 	Clientset        *kubernetes.Clientset
 	RookClientset    *rookclient.Clientset
+	BucketClientset  *bktclient.Clientset
 	RunningInCluster bool
 	T                func() *testing.T
 }
@@ -91,8 +93,17 @@ func CreateK8sHelper(t func() *testing.T) (*K8sHelper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get rook clientset. %+v", err)
 	}
+	bucketClientset, err := bktclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get lib-bucket-provisioner clientset. %+v", err)
+	}
 
-	h := &K8sHelper{executor: executor, Clientset: clientset, RookClientset: rookClientset, T: t}
+	remoteExecutor := &exec.RemotePodCommandExecutor{
+		ClientSet:  clientset,
+		RestClient: config,
+	}
+
+	h := &K8sHelper{executor: executor, Clientset: clientset, RookClientset: rookClientset, BucketClientset: bucketClientset, T: t, remoteExecutor: remoteExecutor}
 	if strings.Contains(config.Host, "//10.") {
 		h.RunningInCluster = true
 	}
@@ -113,16 +124,14 @@ func (k8sh *K8sHelper) GetK8sServerVersion() string {
 	return versionInfo.GitVersion
 }
 
-func (k8sh *K8sHelper) VersionAtLeast(minVersion string) bool {
-	v := version.MustParseSemantic(k8sh.GetK8sServerVersion())
+func VersionAtLeast(actualVersion, minVersion string) bool {
+	v := version.MustParseSemantic(actualVersion)
 	return v.AtLeast(version.MustParseSemantic(minVersion))
 }
 
-func (k8sh *K8sHelper) VersionMinorMatches(minVersion string) (string, bool) {
-	kubeVersion := k8sh.GetK8sServerVersion()
-	v := version.MustParseSemantic(kubeVersion)
-	requestedVersion := version.MustParseSemantic(minVersion)
-	return kubeVersion, v.Major() == requestedVersion.Major() && v.Minor() == requestedVersion.Minor()
+func (k8sh *K8sHelper) VersionAtLeast(minVersion string) bool {
+	v := version.MustParseSemantic(k8sh.GetK8sServerVersion())
+	return v.AtLeast(version.MustParseSemantic(minVersion))
 }
 
 func (k8sh *K8sHelper) MakeContext() *clusterd.Context {
@@ -143,9 +152,9 @@ func (k8sh *K8sHelper) SetDeploymentVersion(namespace, deploymentName, container
 	return err
 }
 
-// Kubectl is wrapper for executing kubectl commands
-func (k8sh *K8sHelper) Kubectl(args ...string) (string, error) {
-	result, err := k8sh.executor.ExecuteCommandWithTimeout(15*time.Second, "kubectl", args...)
+// KubectlWithTimeout is wrapper for executing kubectl commands
+func (k8sh *K8sHelper) KubectlWithTimeout(timeout time.Duration, args ...string) (string, error) {
+	result, err := k8sh.executor.ExecuteCommandWithTimeout(timeout*time.Second, "kubectl", args...)
 	if err != nil {
 		k8slogger.Errorf("Failed to execute: %s %+v : %+v. %s", cmd, args, err, result)
 		if args[0] == "delete" {
@@ -155,6 +164,13 @@ func (k8sh *K8sHelper) Kubectl(args ...string) (string, error) {
 		return result, fmt.Errorf("Failed to run: %s %v : %v", cmd, args, err)
 	}
 	return result, nil
+}
+
+// Kubectl is wrapper for executing kubectl commands and a timeout of 15 seconds
+func (k8sh *K8sHelper) Kubectl(args ...string) (string, error) {
+
+	return k8sh.KubectlWithTimeout(15, args...)
+
 }
 
 // KubectlWithStdin is wrapper for executing kubectl commands in stdin
@@ -188,58 +204,29 @@ func getManifestFromURL(url string) (string, error) {
 		return "", errors.Wrapf(err, "failed to get manifest from url %s", url)
 	}
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to read manifest from url %s", url)
 	}
 	return string(body), nil
 }
 
-func (k8sh *K8sHelper) Exec(namespace, podName, command string, commandArgs []string) (string, error) {
-	return k8sh.ExecWithRetry(1, namespace, podName, command, commandArgs)
-}
-
-// ExecWithRetry will attempt to run a command "retries" times, waiting 3s between each call. Upon success, returns the output.
-func (k8sh *K8sHelper) ExecWithRetry(retries int, namespace, podName, command string, commandArgs []string) (string, error) {
+// ExecToolboxWithRetry will attempt to run a toolbox command "retries" times, waiting 3s between each call. Upon success, returns the output.
+func (k8sh *K8sHelper) ExecToolboxWithRetry(retries int, namespace, command string, commandArgs []string) (string, error) {
 	var err error
+	var output, stderr string
+	cliFinal := append([]string{command}, commandArgs...)
 	for i := 0; i < retries; i++ {
-		args := []string{"exec", "-n", namespace, podName, "--", command}
-		args = append(args, commandArgs...)
-		var result string
-		result, err = k8sh.Kubectl(args...)
+		output, stderr, err = k8sh.remoteExecutor.ExecCommandInContainerWithFullOutput(context.TODO(), "rook-ceph-tools", "rook-ceph-tools", namespace, cliFinal...)
 		if err == nil {
-			return result, nil
+			return output, nil
 		}
 		if i < retries-1 {
+			logger.Warningf("remote command %v execution failed trying again... %v", cliFinal, kerrors.ReasonForError(err))
 			time.Sleep(3 * time.Second)
 		}
 	}
-	return "", fmt.Errorf("%s exec command %s failed on pod %s in namespace %s. %+v", cmd, command, podName, namespace, err)
-}
-
-// ResourceOperationFromTemplate performs a kubectl action from a template file after replacing its context
-func (k8sh *K8sHelper) ResourceOperationFromTemplate(action string, podDefinition string, config map[string]string) (string, error) {
-
-	t := template.New("testTemplate")
-	t, err := t.Parse(podDefinition)
-	if err != nil {
-		return err.Error(), err
-	}
-	var tpl bytes.Buffer
-
-	if err := t.Execute(&tpl, config); err != nil {
-		return err.Error(), err
-	}
-
-	podDef := tpl.String()
-
-	args := []string{action, "-f", "-"}
-	result, err := k8sh.KubectlWithStdin(podDef, args...)
-	if err == nil {
-		return result, nil
-	}
-	logger.Errorf("Failed to execute kubectl %v %v -- %v", args, podDef, err)
-	return "", fmt.Errorf("Could not %s resource in args : %v  %v-- %v", action, args, podDef, err)
+	return "", fmt.Errorf("remote exec command %v failed on pod in namespace %s. %s. %s. %+v", cliFinal, namespace, output, stderr, err)
 }
 
 // ResourceOperation performs a kubectl action on a pod definition
@@ -268,16 +255,6 @@ func (k8sh *K8sHelper) DeletePod(namespace, name string) error {
 	return k8sh.DeleteResourceAndWait(true, args...)
 }
 
-// DeletePods performs a kubectl delete pod on the given pods
-func (k8sh *K8sHelper) DeletePods(pods ...string) (msg string, err error) {
-	for _, pod := range pods {
-		if perr := k8sh.DeletePod("", pod); perr != nil {
-			err = perr
-		}
-	}
-	return
-}
-
 // DeleteResource performs a kubectl delete on the given args
 func (k8sh *K8sHelper) DeleteResource(args ...string) error {
 	return k8sh.DeleteResourceAndWait(true, args...)
@@ -287,7 +264,7 @@ func (k8sh *K8sHelper) DeleteResource(args ...string) error {
 func (k8sh *K8sHelper) WaitForCustomResourceDeletion(namespace, name string, checkerFunc func() error) error {
 
 	// wait for the operator to finalize and delete the CRD
-	for i := 0; i < 60; i++ {
+	for i := 0; i < 90; i++ {
 		err := checkerFunc()
 		if err == nil {
 			logger.Infof("custom resource %q in namespace %q still exists", name, namespace)
@@ -301,7 +278,7 @@ func (k8sh *K8sHelper) WaitForCustomResourceDeletion(namespace, name string, che
 		return err
 	}
 	logger.Errorf("gave up deleting custom resource %q ", name)
-	return nil
+	return fmt.Errorf("Timed out waiting for deletion of custom resource %q", name)
 }
 
 // DeleteResource performs a kubectl delete on give args.
@@ -325,7 +302,7 @@ func (k8sh *K8sHelper) GetResource(args ...string) (string, error) {
 	if err == nil {
 		return result, nil
 	}
-	return "", fmt.Errorf("Could Not get resource in k8s -- %v", err)
+	return result, fmt.Errorf("Could Not get resource in k8s -- %v", err)
 }
 
 func (k8sh *K8sHelper) CreateNamespace(namespace string) error {
@@ -364,6 +341,9 @@ func (k8sh *K8sHelper) WaitForPodCount(label, namespace string, count int) error
 
 		if len(pods.Items) >= count {
 			logger.Infof("found %d pods with label %s", count, label)
+			for _, pod := range pods.Items {
+				logger.Infof("pod found includes %q with status %q", pod.Name, pod.Status.Phase)
+			}
 			return nil
 		}
 
@@ -371,6 +351,28 @@ func (k8sh *K8sHelper) WaitForPodCount(label, namespace string, count int) error
 		time.Sleep(RetryInterval * time.Second)
 	}
 	return fmt.Errorf("Giving up waiting for pods with label %s in namespace %s", label, namespace)
+}
+
+func (k8sh *K8sHelper) WaitForStatusPhase(namespace, kind, name, desiredPhase string, timeout time.Duration) error {
+	baseErr := fmt.Sprintf("waiting for resource %q %q in namespace %q to have status.phase %q", kind, name, namespace, desiredPhase)
+	err := wait.PollUntilContextTimeout(context.TODO(), 3*time.Second, timeout, true, func(context context.Context) (done bool, err error) {
+		phase, err := k8sh.GetResource("--namespace", namespace, kind, name, "--output", "jsonpath={.status.phase}")
+		if err != nil {
+			logger.Warningf("error %s. %v", baseErr, err)
+		}
+
+		if phase == desiredPhase {
+			return true, nil
+		}
+
+		logger.Infof("%s", baseErr)
+		return false, nil
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed %s", baseErr)
+	}
+
+	return nil
 }
 
 // IsPodWithLabelPresent return true if there is at least one Pod with the label is present.
@@ -458,6 +460,31 @@ func (k8sh *K8sHelper) PrintPodStatus(namespace string) {
 	}
 }
 
+func (k8sh *K8sHelper) GetPodRestartsFromNamespace(namespace, testName, platformName string) {
+	logger.Infof("will alert if any pods were restarted in namespace %s", namespace)
+	pods, err := k8sh.Clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		logger.Errorf("failed to list pods in namespace %s. %+v", namespace, err)
+		return
+	}
+	for _, pod := range pods.Items {
+		podName := pod.Name
+		for _, status := range pod.Status.ContainerStatuses {
+			if strings.Contains(podName, status.Name) {
+				if status.RestartCount > int32(0) {
+					logger.Infof("number of time pod %s has restarted is %d", podName, status.RestartCount)
+				}
+
+				// Skipping `mgr` pod count to get the CI green and seems like this is related to ceph Reef.
+				// Refer to this issue https://github.com/rook/rook/issues/12646 and remove once it is fixed.
+				if !strings.Contains(podName, "rook-ceph-mgr") && status.RestartCount == int32(1) {
+					assert.Equal(k8sh.T(), int32(0), status.RestartCount)
+				}
+			}
+		}
+	}
+}
+
 func (k8sh *K8sHelper) GetPodDescribeFromNamespace(namespace, testName, platformName string) {
 	ctx := context.TODO()
 	logger.Infof("Gathering pod describe for all pods in namespace %s", namespace)
@@ -496,7 +523,7 @@ func (k8sh *K8sHelper) GetEventsFromNamespace(namespace, testName, platformName 
 	if events == "" {
 		return
 	}
-	file.WriteString(events) //nolint, ok to ignore this test logging
+	file.WriteString(events) //nolint // ok to ignore this test logging
 }
 
 func (k8sh *K8sHelper) appendPodDescribe(file *os.File, namespace, name string) {
@@ -504,9 +531,9 @@ func (k8sh *K8sHelper) appendPodDescribe(file *os.File, namespace, name string) 
 	if description == "" {
 		return
 	}
-	writeHeader(file, fmt.Sprintf("Pod: %s\n", name)) //nolint, ok to ignore this test logging
-	file.WriteString(description)                     //nolint, ok to ignore this test logging
-	file.WriteString("\n")                            //nolint, ok to ignore this test logging
+	writeHeader(file, fmt.Sprintf("Pod: %s\n", name)) //nolint // ok to ignore this test logging
+	file.WriteString(description)                     //nolint // ok to ignore this test logging
+	file.WriteString("\n")                            //nolint // ok to ignore this test logging
 }
 
 func (k8sh *K8sHelper) PrintPodDescribe(namespace string, args ...string) {
@@ -525,20 +552,6 @@ func (k8sh *K8sHelper) getPodDescribe(namespace string, args ...string) string {
 		return ""
 	}
 	return description
-}
-
-func (k8sh *K8sHelper) PrintEventsForNamespace(namespace string) {
-	ctx := context.TODO()
-	events, err := k8sh.Clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		logger.Warningf("failed to get events in namespace %s. %+v", namespace, err)
-		return
-	}
-	logger.Infof("DUMPING events in namespace %s", namespace)
-	for _, event := range events.Items {
-		logger.Infof("%+v", event)
-	}
-	logger.Infof("DONE DUMPING events in namespace %s", namespace)
 }
 
 // IsPodRunning returns true if a Pod is running status or goes to Running status within 90s else returns false
@@ -622,7 +635,7 @@ func (k8sh *K8sHelper) IsCRDPresent(crdName string) bool {
 	for i := 0; i < RetryLoop; i++ {
 		_, err := k8sh.Kubectl(cmdArgs...)
 		if err == nil {
-			k8slogger.Infof("Found the CRD resource: " + crdName)
+			k8slogger.Infof("Found the CRD resource: %s", crdName)
 			return true
 		}
 		time.Sleep(RetryInterval * time.Second)
@@ -743,53 +756,6 @@ func (k8sh *K8sHelper) GetVolumeResourceName(namespace, pvcName string) (string,
 	return pvc.Spec.VolumeName, nil
 }
 
-// IsVolumeResourcePresent returns true if Volume resource is present
-func (k8sh *K8sHelper) IsVolumeResourcePresent(namespace, volumeName string) bool {
-	err := k8sh.waitForVolume(namespace, volumeName, true)
-	if err != nil {
-		k8slogger.Error(err.Error())
-		return false
-	}
-	return true
-}
-
-// IsVolumeResourceAbsent returns true if the Volume resource is deleted/absent within 90s else returns false
-func (k8sh *K8sHelper) IsVolumeResourceAbsent(namespace, volumeName string) bool {
-
-	err := k8sh.waitForVolume(namespace, volumeName, false)
-	if err != nil {
-		k8slogger.Error(err.Error())
-		return false
-	}
-	return true
-}
-
-func (k8sh *K8sHelper) waitForVolume(namespace, volumeName string, exist bool) error {
-
-	action := "exist"
-	if !exist {
-		action = "not " + action
-	}
-
-	for i := 0; i < 10; i++ {
-		isExist, err := k8sh.isVolumeExist(namespace, volumeName)
-		if err != nil {
-			return fmt.Errorf("Errors encountered while getting Volume %s/%s: %v", namespace, volumeName, err)
-		}
-		if isExist == exist {
-			return nil
-		}
-
-		k8slogger.Infof("waiting for Volume %s in namespace %s to %s", volumeName, namespace, action)
-		time.Sleep(RetryInterval * time.Second)
-	}
-
-	k8sh.printVolumes(namespace, volumeName)
-	k8sh.PrintPVs(false /*detailed*/)
-	k8sh.PrintPVCs(namespace, false /*detailed*/)
-	return fmt.Errorf("timeout for Volume %s in namespace %s wait to %s", volumeName, namespace, action)
-}
-
 func (k8sh *K8sHelper) PrintPVs(detailed bool) {
 	ctx := context.TODO()
 	pvs, err := k8sh.Clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
@@ -866,32 +832,6 @@ func (k8sh *K8sHelper) PrintStorageClasses(detailed bool) {
 	}
 }
 
-func (k8sh *K8sHelper) printVolumes(namespace, desiredVolume string) {
-	ctx := context.TODO()
-	volumes, err := k8sh.RookClientset.RookV1alpha2().Volumes(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		logger.Infof("failed to list volumes in ns %s. %+v", namespace, err)
-	}
-
-	var names []string
-	for _, volume := range volumes.Items {
-		names = append(names, volume.Name)
-	}
-	logger.Infof("looking for volume %s in namespace %s. Found volumes: %v", desiredVolume, namespace, names)
-}
-
-func (k8sh *K8sHelper) isVolumeExist(namespace, name string) (bool, error) {
-	ctx := context.TODO()
-	_, err := k8sh.RookClientset.RookV1alpha2().Volumes(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 func (k8sh *K8sHelper) GetPodNamesForApp(appName, namespace string) ([]string, error) {
 	args := []string{"get", "pod", "-n", namespace, "-l", fmt.Sprintf("app=%s", appName),
 		"-o", "jsonpath={.items[*].metadata.name}"}
@@ -960,8 +900,8 @@ func (k8sh *K8sHelper) IsPodInError(podNamePattern, namespace, reason, containin
 	return false
 }
 
-// GetPodHostID returns HostIP address of a pod
-func (k8sh *K8sHelper) GetPodHostID(podNamePattern string, namespace string) (string, error) {
+// GetPodHostIP returns HostIP address of a pod
+func (k8sh *K8sHelper) GetPodHostIP(podNamePattern string, namespace string) (string, error) {
 	ctx := context.TODO()
 	listOpts := metav1.ListOptions{LabelSelector: "app=" + podNamePattern}
 	podList, err := k8sh.Clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
@@ -1008,7 +948,7 @@ func (k8sh *K8sHelper) IsDefaultStorageClassPresent() (bool, error) {
 	}
 
 	for _, sc := range scs.Items {
-		if storagev1util.IsDefaultAnnotation(sc.ObjectMeta) {
+		if isDefaultAnnotation(sc.ObjectMeta) {
 			return true, nil
 		}
 	}
@@ -1122,11 +1062,9 @@ func (k8sh *K8sHelper) IsPodInExpectedState(podNamePattern string, namespace str
 	for i := 0; i < RetryLoop; i++ {
 		podList, err := k8sh.Clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
 		if err == nil {
-			if len(podList.Items) >= 1 {
-				for _, pod := range podList.Items {
-					if pod.Status.Phase == v1.PodPhase(state) {
-						return true
-					}
+			for _, pod := range podList.Items {
+				if pod.Status.Phase == v1.PodPhase(state) {
+					return true
 				}
 			}
 		}
@@ -1265,10 +1203,28 @@ func (k8sh *K8sHelper) WaitUntilPVCIsDeleted(namespace string, pvcname string) b
 	ctx := context.TODO()
 	for i := 0; i < RetryLoop; i++ {
 		_, err := k8sh.Clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcname, getOpts)
-		if err != nil {
+		if err != nil && kerrors.IsNotFound(err) {
 			return true
 		}
 		logger.Infof("waiting for PVC %s to be deleted.", pvcname)
+
+		time.Sleep(RetryInterval * time.Second)
+	}
+	return false
+}
+
+func (k8sh *K8sHelper) WaitUntilZeroPVs() bool {
+	ListOpts := metav1.ListOptions{}
+	ctx := context.TODO()
+	for i := 0; i < RetryLoop; i++ {
+		pvList, err := k8sh.Clientset.CoreV1().PersistentVolumes().List(ctx, ListOpts)
+		if err != nil && kerrors.IsNotFound(err) {
+			return true
+		}
+		if len(pvList.Items) == 0 {
+			return true
+		}
+		logger.Infof("waiting for PV count to be zero.")
 
 		time.Sleep(RetryInterval * time.Second)
 	}
@@ -1349,13 +1305,13 @@ spec:
 
 func (k8sh *K8sHelper) GetRGWServiceURL(storeName string, namespace string) (string, error) {
 	if k8sh.RunningInCluster {
-		return k8sh.GetInternalRGWServiceURL(storeName, namespace)
+		return k8sh.getInternalRGWServiceURL(storeName, namespace)
 	}
-	return k8sh.GetExternalRGWServiceURL(storeName, namespace)
+	return k8sh.getExternalRGWServiceURL(storeName, namespace)
 }
 
 // GetRGWServiceURL returns URL of ceph RGW service in the cluster
-func (k8sh *K8sHelper) GetInternalRGWServiceURL(storeName string, namespace string) (string, error) {
+func (k8sh *K8sHelper) getInternalRGWServiceURL(storeName string, namespace string) (string, error) {
 	name := "rook-ceph-rgw-" + storeName
 	svc, err := k8sh.GetService(name, namespace)
 	if err != nil {
@@ -1368,8 +1324,8 @@ func (k8sh *K8sHelper) GetInternalRGWServiceURL(storeName string, namespace stri
 }
 
 // GetRGWServiceURL returns URL of ceph RGW service in the cluster
-func (k8sh *K8sHelper) GetExternalRGWServiceURL(storeName string, namespace string) (string, error) {
-	hostip, err := k8sh.GetPodHostID("rook-ceph-rgw", namespace)
+func (k8sh *K8sHelper) getExternalRGWServiceURL(storeName string, namespace string) (string, error) {
+	hostip, err := k8sh.GetPodHostIP("rook-ceph-rgw", namespace)
 	if err != nil {
 		return "", fmt.Errorf("RGW pods not found. %+v", err)
 	}
@@ -1479,7 +1435,7 @@ func (k8sh *K8sHelper) createTestLogFile(platformName, name, namespace, testName
 		}
 	}
 	fileName := fmt.Sprintf("%s_%s_%s_%s%s_%d.log", testName, platformName, namespace, name, suffix, time.Now().Unix())
-	filePath := path.Join(logDir, fileName)
+	filePath := path.Join(logDir, strings.ReplaceAll(fileName, "/", "_"))
 	file, err := os.Create(filePath)
 	if err != nil {
 		logger.Errorf("Cannot create file %s. %v", filePath, err)
@@ -1510,9 +1466,9 @@ func (k8sh *K8sHelper) getPodLogs(pod v1.Pod, platformName, namespace, testName 
 }
 
 func writeHeader(file *os.File, message string) error {
-	file.WriteString("\n-----------------------------------------\n") //nolint, ok to ignore this test logging
-	file.WriteString(message)                                         //nolint, ok to ignore this test logging
-	file.WriteString("\n-----------------------------------------\n") //nolint, ok to ignore this test logging
+	file.WriteString("\n-----------------------------------------\n") //nolint // ok to ignore this test logging
+	file.WriteString(message)                                         //nolint // ok to ignore this test logging
+	file.WriteString("\n-----------------------------------------\n") //nolint // ok to ignore this test logging
 
 	return nil
 }
@@ -1522,7 +1478,7 @@ func (k8sh *K8sHelper) appendContainerLogs(file *os.File, pod v1.Pod, containerN
 	if initContainer {
 		message = "INIT " + message
 	}
-	writeHeader(file, message) //nolint, ok to ignore this test logging
+	writeHeader(file, message) //nolint // ok to ignore this test logging
 	ctx := context.TODO()
 	logOpts := &v1.PodLogOptions{Previous: previousLog}
 	if containerName != "" {
@@ -1571,31 +1527,6 @@ func (k8sh *K8sHelper) CreateAnonSystemClusterBinding() {
 	}
 }
 
-func (k8sh *K8sHelper) DeleteRoleAndBindings(name, namespace string) error {
-	err := k8sh.DeleteResource("role", name, "-n", namespace)
-	if err != nil {
-		return err
-	}
-
-	err = k8sh.DeleteResource("rolebinding", name, "-n", namespace)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (k8sh *K8sHelper) DeleteRoleBinding(name, namespace string) error {
-	err := k8sh.DeleteResource("rolebinding", name, "-n", namespace)
-	return err
-}
-
-func (k8sh *K8sHelper) ScaleStatefulSet(statefulSetName, namespace string, replicationSize int) error {
-	args := []string{"-n", namespace, "scale", "statefulsets", statefulSetName, fmt.Sprintf("--replicas=%d", replicationSize)}
-	_, err := k8sh.Kubectl(args...)
-	return err
-}
-
 func IsKubectlErrorNotFound(output string, err error) bool {
 	return err != nil && strings.Contains(output, "Error from server (NotFound)")
 }
@@ -1603,13 +1534,13 @@ func IsKubectlErrorNotFound(output string, err error) bool {
 // WaitForDeploymentCount waits until the desired number of deployments with the label exist. The
 // deployments are not guaranteed to be running, only existing.
 func (k8sh *K8sHelper) WaitForDeploymentCount(label, namespace string, count int) error {
-	return k8sh.WaitForDeploymentCountWithRetries(label, namespace, count, RetryLoop)
+	return k8sh.waitForDeploymentCountWithRetries(label, namespace, count, RetryLoop)
 }
 
 // WaitForDeploymentCountWithRetries waits until the desired number of deployments with the label
 // exist, retrying the specified number of times. The deployments are not guaranteed to be running,
 // only existing.
-func (k8sh *K8sHelper) WaitForDeploymentCountWithRetries(label, namespace string, count, retries int) error {
+func (k8sh *K8sHelper) waitForDeploymentCountWithRetries(label, namespace string, count, retries int) error {
 	ctx := context.TODO()
 	options := metav1.ListOptions{LabelSelector: label}
 	for i := 0; i < retries; i++ {
@@ -1675,8 +1606,7 @@ func (k8sh *K8sHelper) WaitForLabeledDeploymentsToBeReadyWithRetries(label, name
 
 func (k8sh *K8sHelper) WaitForCronJob(name, namespace string) error {
 	for i := 0; i < RetryLoop; i++ {
-		_, err := k8sh.Clientset.BatchV1beta1().CronJobs(namespace).Get(context.TODO(), name, metav1.GetOptions{})
-
+		_, err := k8sh.Clientset.BatchV1().CronJobs(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			if kerrors.IsNotFound(err) {
 				logger.Infof("waiting for CronJob named %s in namespace %s", name, namespace)
@@ -1691,4 +1621,22 @@ func (k8sh *K8sHelper) WaitForCronJob(name, namespace string) error {
 		return nil
 	}
 	return fmt.Errorf("giving up waiting for CronJob named %s in namespace %s", name, namespace)
+}
+
+func (k8sh *K8sHelper) GetResourceStatus(kind, name, namespace string) (string, error) {
+	return k8sh.Kubectl("-n", namespace, "get", kind, name) // TODO: -o status
+}
+
+func (k8sh *K8sHelper) WaitUntilResourceIsDeleted(kind, namespace, name string) error {
+	var err error
+	var out string
+	for i := 0; i < RetryLoop; i++ {
+		out, err = k8sh.Kubectl("-n", namespace, "get", kind, name, "-o", "name")
+		if strings.Contains(out, "Error from server (NotFound): ") {
+			return nil
+		}
+		logger.Infof("waiting %d more seconds for resource %s %q to be deleted:\n%s", RetryInterval, kind, name, out)
+		time.Sleep(RetryInterval * time.Second)
+	}
+	return errors.Wrapf(err, "timed out waiting for resource %s %q to be deleted:\n%s", kind, name, out)
 }

@@ -38,6 +38,12 @@ func (e *TranslateCommandExecutor) ExecuteCommand(command string, arg ...string)
 	return e.Executor.ExecuteCommand(transCommand, transArgs...)
 }
 
+// ExecuteCommandWithStdin starts a process, provides stdin and wait for its completion with timeout.
+func (e *TranslateCommandExecutor) ExecuteCommandWithStdin(timeout time.Duration, command string, stdin *string, arg ...string) error {
+	transCommand, transArgs := e.Translator(command, arg...)
+	return e.Executor.ExecuteCommandWithStdin(timeout, transCommand, stdin, transArgs...)
+}
+
 // ExecuteCommandWithEnv starts a process with an env variable and wait for its completion
 func (e *TranslateCommandExecutor) ExecuteCommandWithEnv(env []string, command string, arg ...string) error {
 	transCommand, transArgs := e.Translator(command, arg...)
@@ -54,20 +60,6 @@ func (e *TranslateCommandExecutor) ExecuteCommandWithOutput(command string, arg 
 func (e *TranslateCommandExecutor) ExecuteCommandWithCombinedOutput(command string, arg ...string) (string, error) {
 	transCommand, transArgs := e.Translator(command, arg...)
 	return e.Executor.ExecuteCommandWithCombinedOutput(transCommand, transArgs...)
-}
-
-// ExecuteCommandWithOutputFile starts a process and saves output to file
-func (e *TranslateCommandExecutor) ExecuteCommandWithOutputFile(command, outfileArg string, arg ...string) (string, error) {
-	transCommand, transArgs := e.Translator(command, arg...)
-	return e.Executor.ExecuteCommandWithOutputFile(transCommand, outfileArg, transArgs...)
-}
-
-// ExecuteCommandWithOutputFileTimeout is the same as ExecuteCommandWithOutputFile but with a timeout limit.
-func (e *TranslateCommandExecutor) ExecuteCommandWithOutputFileTimeout(
-	timeout time.Duration,
-	command, outfileArg string, arg ...string) (string, error) {
-	transCommand, transArgs := e.Translator(command, arg...)
-	return e.Executor.ExecuteCommandWithOutputFileTimeout(timeout, transCommand, outfileArg, transArgs...)
 }
 
 // ExecuteCommandWithTimeout starts a process and wait for its completion with timeout.

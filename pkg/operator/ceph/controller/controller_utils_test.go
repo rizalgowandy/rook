@@ -17,10 +17,18 @@ limitations under the License.
 package controller
 
 import (
+	ctx "context"
 	"testing"
+	"time"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
+	"github.com/rook/rook/pkg/util/exec"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func CreateTestClusterFromStatusDetails(details map[string]cephv1.CephHealthMessage) cephv1.CephCluster {
@@ -69,4 +77,214 @@ func TestCanIgnoreHealthErrStatusInReconcile(t *testing.T) {
 		},
 	})
 	assert.False(t, canIgnoreHealthErrStatusInReconcile(cluster, "controller"))
+}
+
+func TestSetCephCommandsTimeout(t *testing.T) {
+	SetCephCommandsTimeout(map[string]string{})
+	assert.Equal(t, 15*time.Second, exec.CephCommandsTimeout)
+
+	exec.CephCommandsTimeout = 0
+	SetCephCommandsTimeout(map[string]string{"ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS": "0"})
+	assert.Equal(t, 15*time.Second, exec.CephCommandsTimeout)
+
+	exec.CephCommandsTimeout = 0
+	SetCephCommandsTimeout(map[string]string{"ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS": "1"})
+	assert.Equal(t, 1*time.Second, exec.CephCommandsTimeout)
+}
+
+func TestSetAllowLoopDevices(t *testing.T) {
+	SetAllowLoopDevices(map[string]string{})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "foo"})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "false"})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "true"})
+	assert.True(t, LoopDevicesAllowed())
+}
+
+func TestSetEnforceHostNetwork(t *testing.T) {
+	logger.Infof("testing default value for %v", enforceHostNetworkSettingName)
+	opConfig := map[string]string{}
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+
+	// test invalid setting
+	var value string = "foo"
+	logger.Infof("testing invalid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+
+	// test valid settings
+	value = "true"
+	logger.Infof("testing valid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.True(t, EnforceHostNetwork())
+
+	value = "false"
+	logger.Infof("testing valid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+}
+
+func TestSetRevisionHistoryLimit(t *testing.T) {
+	opConfig := map[string]string{}
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test default value", func(t *testing.T) {
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+
+	var value string = "foo"
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test invalid value 'foo'", func(t *testing.T) {
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test empty string value", func(t *testing.T) {
+		value = ""
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+	t.Run("ROOK_REVISION_HISTORY_LIMIT:  test valig value '10'", func(t *testing.T) {
+		value = "10"
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Equal(t, int32(10), *RevisionHistoryLimit())
+	})
+}
+func TestIsReadyToReconcile(t *testing.T) {
+	scheme := scheme.Scheme
+	scheme.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
+
+	controllerName := "testing"
+	clusterName := types.NamespacedName{Name: "mycluster", Namespace: "myns"}
+
+	t.Run("non-existent cephcluster", func(t *testing.T) {
+		client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects().Build()
+		c, ready, clusterExists, reconcileResult := IsReadyToReconcile(ctx.TODO(), client, clusterName, controllerName)
+		assert.NotNil(t, c)
+		assert.False(t, ready)
+		assert.False(t, clusterExists)
+		assert.Equal(t, WaitForRequeueIfCephClusterNotReady, reconcileResult)
+	})
+
+	t.Run("valid cephcluster", func(t *testing.T) {
+		cephCluster := &cephv1.CephCluster{}
+		objects := []runtime.Object{cephCluster}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
+		c, ready, clusterExists, reconcileResult := IsReadyToReconcile(ctx.TODO(), client, clusterName, controllerName)
+		assert.NotNil(t, c)
+		assert.False(t, ready)
+		assert.False(t, clusterExists)
+		assert.Equal(t, WaitForRequeueIfCephClusterNotReady, reconcileResult)
+	})
+
+	t.Run("deleted cephcluster with no cleanup policy", func(t *testing.T) {
+		cephCluster := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              clusterName.Name,
+				Namespace:         clusterName.Namespace,
+				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"test"},
+			},
+		}
+
+		objects := []runtime.Object{cephCluster}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
+		c, ready, clusterExists, reconcileResult := IsReadyToReconcile(ctx.TODO(), client, clusterName, controllerName)
+		assert.NotNil(t, c)
+		assert.False(t, ready)
+		assert.True(t, clusterExists)
+		assert.Equal(t, WaitForRequeueIfCephClusterNotReady, reconcileResult)
+	})
+
+	t.Run("cephcluster with cleanup policy when not deleted", func(t *testing.T) {
+		cephCluster := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName.Name,
+				Namespace: clusterName.Namespace,
+			},
+			Spec: cephv1.ClusterSpec{
+				CleanupPolicy: cephv1.CleanupPolicySpec{
+					Confirmation: cephv1.DeleteDataDirOnHostsConfirmation,
+				},
+			}}
+		objects := []runtime.Object{cephCluster}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
+		c, ready, clusterExists, _ := IsReadyToReconcile(ctx.TODO(), client, clusterName, controllerName)
+		assert.NotNil(t, c)
+		assert.False(t, ready)
+		assert.True(t, clusterExists)
+	})
+
+	t.Run("cephcluster with cleanup policy when deleted", func(t *testing.T) {
+		cephCluster := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              clusterName.Name,
+				Namespace:         clusterName.Namespace,
+				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"test"},
+			},
+			Spec: cephv1.ClusterSpec{
+				CleanupPolicy: cephv1.CleanupPolicySpec{
+					Confirmation: cephv1.DeleteDataDirOnHostsConfirmation,
+				},
+			}}
+		objects := []runtime.Object{cephCluster}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
+		c, ready, clusterExists, _ := IsReadyToReconcile(ctx.TODO(), client, clusterName, controllerName)
+		assert.NotNil(t, c)
+		assert.False(t, ready)
+		assert.False(t, clusterExists)
+	})
+}
+
+func TestObcAllowAdditionalConfigFields(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           map[string]string
+		shouldAllow    []string
+		shouldDisallow []string
+	}{
+		{"not set", map[string]string{},
+			[]string{"maxObjects", "maxSize"}, // default allowlist is unlikely to need changing EVER
+			[]string{"bucketMaxObjects", "bucketMaxSize", "bucketPolicy", "bucketLifecycle", "bucketOwner", "random"}},
+		{"set to empty", map[string]string{"ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS": ""},
+			[]string{}, // admin can allow no quota options if desired
+			[]string{"maxObjects", "maxSize", "bucketMaxObjects", "bucketMaxSize", "bucketPolicy", "bucketLifecycle", "bucketOwner", "random"}},
+		{"set to default", map[string]string{"ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS": "maxObjects,maxSize"},
+			[]string{"maxObjects", "maxSize"},
+			[]string{"bucketMaxObjects", "bucketMaxSize", "bucketPolicy", "bucketLifecycle", "bucketOwner", "random"}},
+		{"all quota fields", map[string]string{"ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS": "maxObjects,maxSize,bucketMaxObjects,bucketMaxSize"},
+			[]string{"maxObjects", "maxSize", "bucketMaxObjects", "bucketMaxSize"},
+			[]string{"bucketPolicy", "bucketLifecycle", "bucketOwner", "random"}},
+		{"all fields", map[string]string{"ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS": "maxObjects,maxSize,bucketMaxObjects,bucketMaxSize,bucketPolicy,bucketLifecycle,bucketOwner"},
+			[]string{"maxObjects", "maxSize", "bucketMaxObjects", "bucketMaxSize", "bucketPolicy", "bucketLifecycle", "bucketOwner"},
+			[]string{"random"}},
+		// this mechanism doesn't do any field checking - that isn't it's job - it merely handles
+		// allow-listing essentially arbitrary config keys
+		{"all fields including unknown", map[string]string{"ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS": "maxObjects,maxSize,bucketMaxObjects,bucketMaxSize,bucketPolicy,bucketLifecycle,bucketOwner,random"},
+			[]string{"maxObjects", "maxSize", "bucketMaxObjects", "bucketMaxSize", "bucketPolicy", "bucketLifecycle", "bucketOwner", "random"},
+			[]string{"otherRandom"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetObcAllowAdditionalConfigFields(tt.data)
+
+			for _, toAllow := range tt.shouldAllow {
+				assert.True(t, ObcAdditionalConfigKeyIsAllowed(toAllow))
+			}
+			for _, toDisallow := range tt.shouldDisallow {
+				assert.False(t, ObcAdditionalConfigKeyIsAllowed(toDisallow))
+			}
+		})
+	}
 }

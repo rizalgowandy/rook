@@ -25,21 +25,11 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mgr"
 	opconfig "github.com/rook/rook/pkg/operator/ceph/config"
-	v1 "k8s.io/api/core/v1"
 )
 
 const (
 	dmCryptKeySize = 128
 )
-
-// PrivilegedContext returns a privileged Pod security context
-func PrivilegedContext() *v1.SecurityContext {
-	privileged := true
-
-	return &v1.SecurityContext{
-		Privileged: &privileged,
-	}
-}
 
 func osdOnSDNFlag(network cephv1.NetworkSpec) []string {
 	var args []string
@@ -56,34 +46,23 @@ func encryptionKeyPath() string {
 	return path.Join(opconfig.EtcCephDir, encryptionKeyFileName)
 }
 
-func encryptionDMName(pvcName, blockType string) string {
+func EncryptionDMName(pvcName, blockType string) string {
 	return fmt.Sprintf("%s-%s", pvcName, blockType)
 }
 
-func encryptionDMPath(pvcName, blockType string) string {
-	return path.Join("/dev/mapper", encryptionDMName(pvcName, blockType))
+func EncryptionDMPath(pvcName, blockType string) string {
+	return path.Join("/dev/mapper", EncryptionDMName(pvcName, blockType))
 }
 
 func encryptionBlockDestinationCopy(mountPath, blockType string) string {
 	return path.Join(mountPath, blockType) + "-tmp"
 }
 
-func generateDmCryptKey() (string, error) {
+func GenerateDmCryptKey() (string, error) {
 	key, err := mgr.GenerateRandomBytes(dmCryptKeySize)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to generate random bytes")
 	}
 
 	return base64.StdEncoding.EncodeToString(key), nil
-}
-
-func (c *Cluster) isCephVolumeRawModeSupported() bool {
-	if c.clusterInfo.CephVersion.IsAtLeast(cephVolumeRawEncryptionModeMinNautilusCephVersion) && !c.clusterInfo.CephVersion.IsOctopus() {
-		return true
-	}
-	if c.clusterInfo.CephVersion.IsAtLeast(cephVolumeRawEncryptionModeMinOctopusCephVersion) {
-		return true
-	}
-
-	return false
 }

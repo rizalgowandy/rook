@@ -74,7 +74,7 @@ type CephVolumeInventory struct {
 }
 
 // Run is the entry point of that package execution
-func Run(context *clusterd.Context, probeInterval time.Duration, useCV bool) error {
+func Run(ctx context.Context, context *clusterd.Context, probeInterval time.Duration, useCV bool) error {
 	if context == nil {
 		return fmt.Errorf("nil context")
 	}
@@ -87,13 +87,13 @@ func Run(context *clusterd.Context, probeInterval time.Duration, useCV bool) err
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGTERM)
 
-	err := updateDeviceCM(context)
+	err := updateDeviceCM(ctx, context)
 	if err != nil {
 		logger.Infof("failed to update device configmap: %v", err)
 		return err
 	}
 
-	udevEvents := make(chan string)
+	udevEvents := make(chan struct{})
 	go udevBlockMonitor(udevEvents, udevEventPeriod)
 	for {
 		select {
@@ -101,13 +101,13 @@ func Run(context *clusterd.Context, probeInterval time.Duration, useCV bool) err
 			logger.Infof("shutdown signal received, exiting...")
 			return nil
 		case <-time.After(probeInterval):
-			if err := updateDeviceCM(context); err != nil {
+			if err := updateDeviceCM(ctx, context); err != nil {
 				logger.Errorf("failed to update device configmap during probe interval. %v", err)
 			}
 		case _, ok := <-udevEvents:
 			if ok {
 				logger.Info("trigger probe from udev event")
-				if err := updateDeviceCM(context); err != nil {
+				if err := updateDeviceCM(ctx, context); err != nil {
 					logger.Errorf("failed to update device configmap triggered from udev event. %v", err)
 				}
 			} else {
@@ -148,16 +148,17 @@ func matchUdevEvent(text string, matches, exclusions []string) (bool, error) {
 // Scans `udevadm monitor` output for block sub-system events. Each line of
 // output matching a set of substrings is sent to the provided channel. An event
 // is returned if it passes any matches tests, and passes all exclusion tests.
-func rawUdevBlockMonitor(c chan string, matches, exclusions []string) {
+func rawUdevBlockMonitor(c chan struct{}, matches, exclusions []string) {
 	defer close(c)
 
 	// stdbuf -oL performs line buffered output
-	cmd := exec.Command("stdbuf", "-oL", "udevadm", "monitor", "-u", "-k", "-s", "block")
+	cmd := exec.Command("stdbuf", "-oL", "udevadm", "monitor", "-u", "-s", "block")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		logger.Warningf("Cannot open udevadm stdout: %v", err)
 		return
 	}
+	defer stdout.Close()
 
 	err = cmd.Start()
 	if err != nil {
@@ -175,7 +176,7 @@ func rawUdevBlockMonitor(c chan string, matches, exclusions []string) {
 			return
 		}
 		if match {
-			c <- text
+			c <- struct{}{}
 		}
 	}
 
@@ -188,13 +189,13 @@ func rawUdevBlockMonitor(c chan string, matches, exclusions []string) {
 
 // Monitors udev for block device changes, and collapses these events such that
 // only one event is emitted per period in order to deal with flapping.
-func udevBlockMonitor(c chan string, period time.Duration) {
+func udevBlockMonitor(c chan struct{}, period time.Duration) {
 	defer close(c)
 	var udevFilter []string
 
 	// return any add or remove events, but none that match device mapper
 	// events. string matching is case-insensitive
-	events := make(chan string)
+	events := make(chan struct{})
 
 	// get discoverDaemonUdevBlacklist from the environment variable
 	// if user doesn't provide any regex; generate the default regex
@@ -210,16 +211,20 @@ func udevBlockMonitor(c chan string, period time.Duration) {
 		[]string{"(?i)add", "(?i)remove"},
 		udevFilter)
 
+	timeout := time.NewTimer(period)
+	defer timeout.Stop()
 	for {
-		event, ok := <-events
+		_, ok := <-events
 		if !ok {
 			return
 		}
-		timeout := time.NewTimer(period)
+		if !timeout.Stop() {
+			<-timeout.C
+		}
+		timeout.Reset(period)
 		for {
 			select {
 			case <-timeout.C:
-				break
 			case _, ok := <-events:
 				if !ok {
 					return
@@ -228,7 +233,7 @@ func udevBlockMonitor(c chan string, period time.Duration) {
 			}
 			break
 		}
-		c <- event
+		c <- struct{}{}
 	}
 }
 
@@ -244,7 +249,7 @@ func checkMatchingDevice(checkDev sys.LocalDisk, devices []sys.LocalDisk) *sys.L
 		// check if devices should be considered the same. the uuid can be
 		// unstable, so we also use the reported serial and device name, which
 		// appear to be more stable.
-		if checkDev.UUID == dev.UUID {
+		if checkDev.UUID != "" && dev.UUID != "" && checkDev.UUID == dev.UUID {
 			return &devices[i]
 		}
 
@@ -322,8 +327,7 @@ func DeviceListsEqual(old, new string) (bool, error) {
 	return checkDeviceListsEqual(oldDevs, newDevs), nil
 }
 
-func updateDeviceCM(clusterdContext *clusterd.Context) error {
-	ctx := context.TODO()
+func updateDeviceCM(ctx context.Context, clusterdContext *clusterd.Context) error {
 	logger.Infof("updating device configmap")
 	devices, err := probeDevices(clusterdContext)
 	if err != nil {
@@ -366,7 +370,7 @@ func updateDeviceCM(clusterdContext *clusterd.Context) error {
 		}
 
 		// Get the discover daemon pod details to attach the owner reference to the config map
-		discoverPod, err := k8sutil.GetRunningPod(clusterdContext.Clientset)
+		discoverPod, err := k8sutil.GetRunningPod(ctx, clusterdContext.Clientset)
 		if err != nil {
 			logger.Warningf("failed to get discover pod to set ownerref. %+v", err)
 		} else {
@@ -428,9 +432,6 @@ func probeDevices(context *clusterd.Context) ([]sys.LocalDisk, error) {
 
 	for _, device := range localDevices {
 		if device == nil {
-			continue
-		}
-		if device.Type == sys.PartType {
 			continue
 		}
 

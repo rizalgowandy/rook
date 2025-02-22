@@ -23,46 +23,38 @@ import (
 	"time"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	testexec "github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	apps "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestOSDHealthCheck(t *testing.T) {
 	ctx := context.TODO()
 	clientset := testexec.New(t, 2)
-	clusterInfo := client.AdminClusterInfo("fake")
+	clusterInfo := client.AdminTestClusterInfo("fake")
 
 	var execCount = 0
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
-			return "{\"key\":\"mysecurekey\", \"osdid\":3.0}", nil
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("ExecuteCommandWithOutputFile: %s %v", command, args)
+			execCount++
+			if args[1] == "dump" {
+				// Mock executor for OSD Dump command, returning an osd in Down state
+				return `{"OSDs": [{"OSD": 0, "Up": 0, "In": 0}]}`, nil
+			} else if args[1] == "safe-to-destroy" {
+				// Mock executor for OSD Dump command, returning an osd in Down state
+				return `{"safe_to_destroy":[0],"active":[],"missing_stats":[],"stored_pgs":[]}`, nil
+			} else if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\", \"osdid\":3.0}", nil
+			}
+			return "", nil
 		},
-	}
-	executor.MockExecuteCommandWithOutputFile = func(command string, outFileArg string, args ...string) (string, error) {
-		logger.Infof("ExecuteCommandWithOutputFile: %s %v", command, args)
-		execCount++
-		if args[1] == "dump" {
-			// Mock executor for OSD Dump command, returning an osd in Down state
-			return `{"OSDs": [{"OSD": 0, "Up": 0, "In": 0}]}`, nil
-		} else if args[1] == "safe-to-destroy" {
-			// Mock executor for OSD Dump command, returning an osd in Down state
-			return `{"safe_to_destroy":[0],"active":[],"missing_stats":[],"stored_pgs":[]}`, nil
-		}
-		return "", nil
-	}
-
-	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-		logger.Infof("ExecuteCommandWithOutput: %s %v", command, args)
-		return "", nil
 	}
 
 	// Setting up objects needed to create OSD
@@ -107,15 +99,21 @@ func TestOSDHealthCheck(t *testing.T) {
 }
 
 func TestMonitorStart(t *testing.T) {
-	stopCh := make(chan struct{})
-	osdMon := NewOSDHealthMonitor(&clusterd.Context{}, client.AdminClusterInfo("ns"), true, cephv1.CephClusterHealthCheckSpec{})
+	context, cancel := context.WithCancel(context.TODO())
+	monitoringRoutines := make(map[string]*opcontroller.ClusterHealth)
+	monitoringRoutines["osd"] = &opcontroller.ClusterHealth{
+		InternalCtx:    context,
+		InternalCancel: cancel,
+	}
+
+	osdMon := NewOSDHealthMonitor(&clusterd.Context{}, client.AdminTestClusterInfo("ns"), true, cephv1.CephClusterHealthCheckSpec{})
 	logger.Infof("starting osd monitor")
-	go osdMon.Start(stopCh)
-	close(stopCh)
+	go osdMon.Start(monitoringRoutines, "osd")
+	cancel()
 }
 
 func TestNewOSDHealthMonitor(t *testing.T) {
-	clusterInfo := client.AdminClusterInfo("test")
+	clusterInfo := client.AdminTestClusterInfo("test")
 	c := &clusterd.Context{}
 	time10s, _ := time.ParseDuration("10s")
 	type args struct {
@@ -138,48 +136,4 @@ func TestNewOSDHealthMonitor(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestDeviceClasses(t *testing.T) {
-	clusterInfo := client.AdminClusterInfo("fake")
-	clusterInfo.SetName("rook-ceph")
-
-	var execCount = 0
-	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
-			return "{\"key\":\"mysecurekey\", \"osdid\":3.0}", nil
-		},
-	}
-	executor.MockExecuteCommandWithOutputFile = func(command string, outFileArg string, args ...string) (string, error) {
-		logger.Infof("ExecuteCommandWithOutputFile: %s %v", command, args)
-		execCount++
-		if args[1] == "crush" && args[2] == "class" && args[3] == "ls" {
-			// Mock executor for OSD crush class list command, returning ssd as available device class
-			return `["ssd"]`, nil
-		}
-		return "", nil
-	}
-
-	cephCluster := &cephv1.CephCluster{}
-	// Objects to track in the fake client.
-	object := []runtime.Object{
-		cephCluster,
-	}
-	s := scheme.Scheme
-	// Create a fake client to mock API calls.
-	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
-
-	context := &clusterd.Context{
-		Executor: executor,
-		Client:   cl,
-	}
-
-	// Initializing an OSD monitoring
-	osdMon := NewOSDHealthMonitor(context, clusterInfo, true, cephv1.CephClusterHealthCheckSpec{})
-
-	// Run OSD monitoring routine
-	err := osdMon.checkDeviceClasses()
-	assert.Nil(t, err)
-	// checkDeviceClasses has 1 mocked cmd for fetching the device classes
-	assert.Equal(t, 1, execCount)
 }

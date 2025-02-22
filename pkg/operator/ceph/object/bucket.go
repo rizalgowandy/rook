@@ -22,13 +22,10 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 )
 
 const (
-	beforeOctopusTime   = "2006-01-02 15:04:05.999999999Z"
-	octopusAndAfterTime = "2006-01-02T15:04:05.999999999Z"
+	timeParser = "2006-01-02T15:04:05.999999999Z"
 )
 
 type ObjectBucketMetadata struct {
@@ -154,45 +151,12 @@ func getBucketMetadata(c *Context, bucket string) (*ObjectBucketMetadata, bool, 
 		return nil, false, errors.Wrapf(err, "failed to read buckets list result=%s", match)
 	}
 
-	timeParser := octopusAndAfterTime
-	version, err := cephver.ExtractCephVersion(opcontroller.OperatorCephBaseImageVersion)
-	if err != nil {
-		logger.Errorf("failed to extract ceph version. %v", err)
-	} else {
-		vv := *version
-		if !vv.IsAtLeastOctopus() {
-			timeParser = beforeOctopusTime
-		}
-	}
-
 	createdAt, err := time.Parse(timeParser, s.Data.CreationTime)
 	if err != nil {
 		return nil, false, errors.Wrapf(err, "Error parsing date (%s)", s.Data.CreationTime)
 	}
 
 	return &ObjectBucketMetadata{Owner: s.Data.Owner, CreatedAt: createdAt}, false, nil
-}
-
-func ListBuckets(c *Context) ([]ObjectBucket, error) {
-	logger.Infof("Listing buckets")
-
-	stats, err := GetBucketsStats(c)
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to get bucket stats")
-	}
-
-	buckets := []ObjectBucket{}
-
-	for bucket, stat := range stats {
-		metadata, _, err := getBucketMetadata(c, bucket)
-		if err != nil {
-			return nil, err
-		}
-
-		buckets = append(buckets, ObjectBucket{Name: bucket, ObjectBucketMetadata: ObjectBucketMetadata{Owner: metadata.Owner, CreatedAt: metadata.CreatedAt}, ObjectBucketStats: stat})
-	}
-
-	return buckets, nil
 }
 
 func GetBucket(c *Context, bucket string) (*ObjectBucket, int, error) {
@@ -215,26 +179,4 @@ func GetBucket(c *Context, bucket string) (*ObjectBucket, int, error) {
 	}
 
 	return &ObjectBucket{Name: bucket, ObjectBucketMetadata: ObjectBucketMetadata{Owner: metadata.Owner, CreatedAt: metadata.CreatedAt}, ObjectBucketStats: *stat}, RGWErrorNone, nil
-}
-
-func DeleteObjectBucket(c *Context, bucketName string, purge bool) (int, error) {
-	options := []string{"bucket", "rm", "--bucket", bucketName}
-	if purge {
-		options = append(options, "--purge-objects")
-	}
-
-	result, err := runAdminCommand(c, false, options...)
-	if err != nil {
-		return RGWErrorUnknown, errors.Wrap(err, "failed to delete bucket")
-	}
-
-	if result == "" {
-		return RGWErrorNone, nil
-	}
-
-	if strings.Contains(result, "could not get bucket info for bucket=") {
-		return RGWErrorNotFound, errors.New("Bucket not found")
-	}
-
-	return RGWErrorUnknown, errors.Wrap(err, "failed to delete bucket")
 }

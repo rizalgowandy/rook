@@ -18,8 +18,6 @@ package integration
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"testing"
@@ -35,16 +33,6 @@ import (
 
 const (
 	defaultNamespace = "default"
-	// UPDATE these versions when the integration test matrix changes
-	// These versions are for running a minimal test suite for more efficient tests across different versions of K8s
-	// instead of running all suites on all versions
-	// To run on multiple versions, add a comma separate list such as 1.16.0,1.17.0
-	flexDriverMinimalTestVersion      = "1.15.0"
-	cephMasterSuiteMinimalTestVersion = "1.16.0"
-	multiClusterMinimalTestVersion    = "1.16.0"
-	helmMinimalTestVersion            = "1.17.0"
-	upgradeMinimalTestVersion         = "1.18.0"
-	smokeSuiteMinimalTestVersion      = "1.19.0"
 )
 
 var (
@@ -52,7 +40,7 @@ var (
 )
 
 // Test to make sure all rook components are installed and Running
-func checkIfRookClusterIsInstalled(s suite.Suite, k8sh *utils.K8sHelper, opNamespace, clusterNamespace string, mons int) {
+func checkIfRookClusterIsInstalled(s *suite.Suite, k8sh *utils.K8sHelper, opNamespace, clusterNamespace string, mons int) {
 	logger.Infof("Make sure all Pods in Rook Cluster %s are running", clusterNamespace)
 	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-operator", opNamespace, 1, "Running"),
 		"Make sure there is 1 rook-operator present in Running state")
@@ -66,13 +54,16 @@ func checkIfRookClusterIsInstalled(s suite.Suite, k8sh *utils.K8sHelper, opNames
 		"Make sure there is at lest 1 rook-ceph-crash present in Running state")
 }
 
-func checkIfRookClusterIsHealthy(s suite.Suite, testClient *clients.TestClient, clusterNamespace string) {
+func checkIfRookClusterIsHealthy(s *suite.Suite, testClient *clients.TestClient, clusterNamespace string) {
 	logger.Infof("Testing cluster %s health", clusterNamespace)
-	var err error
+	var (
+		err     error
+		healthy bool
+	)
 
 	retryCount := 0
 	for retryCount < utils.RetryLoop {
-		healthy, err := clients.IsClusterHealthy(testClient, clusterNamespace)
+		healthy, err = clients.IsClusterHealthy(testClient, clusterNamespace)
 		if healthy {
 			logger.Infof("cluster %s is healthy", clusterNamespace)
 			return
@@ -86,6 +77,12 @@ func checkIfRookClusterIsHealthy(s suite.Suite, testClient *clients.TestClient, 
 	require.Nil(s.T(), err)
 }
 
+func checkIfRookClusterHasHealthyIngress(s *suite.Suite, k8sh *utils.K8sHelper, clusterNamespace string) {
+	logger.Infof("Testing ingress %s health", clusterNamespace)
+	_, err := k8sh.GetResourceStatus("Ingress", clusterNamespace+"-dashboard", clusterNamespace)
+	assert.NoError(s.T(), err)
+}
+
 func HandlePanics(r interface{}, uninstaller func(), t func() *testing.T) {
 	if r != nil {
 		logger.Infof("unexpected panic occurred during test %s, --> %v", t().Name(), r)
@@ -95,34 +92,11 @@ func HandlePanics(r interface{}, uninstaller func(), t func() *testing.T) {
 	}
 }
 
-func checkIfShouldRunForMinimalTestMatrix(t func() *testing.T, k8sh *utils.K8sHelper, version string) {
-	testArgs := os.Getenv("TEST_ARGUMENTS")
-	if !strings.Contains(testArgs, "min-test-matrix") {
-		logger.Infof("running all tests")
-		return
-	}
-	versions := strings.Split(version, ",")
-	logger.Infof("checking if tests are running on k8s %q", version)
-	matchedVersion := false
-	kubeVersion := ""
-	for _, v := range versions {
-		kubeVersion, matchedVersion = k8sh.VersionMinorMatches(v)
-		if matchedVersion {
-			break
-		}
-	}
-	if !matchedVersion {
-		logger.Infof("Skipping test suite since kube version %q does not match", kubeVersion)
-		t().Skip()
-	}
-	logger.Infof("Running test suite since kube version is %q", kubeVersion)
-}
-
 // StartTestCluster creates new instance of TestCephSettings struct
-func StartTestCluster(t func() *testing.T, settings *installer.TestCephSettings, minimalMatrixK8sVersion string) (*installer.CephInstaller, *utils.K8sHelper) {
+func StartTestCluster(t func() *testing.T, settings *installer.TestCephSettings) (*installer.CephInstaller, *utils.K8sHelper) {
 	k8shelper, err := utils.CreateK8sHelper(t)
 	require.NoError(t(), err)
-	checkIfShouldRunForMinimalTestMatrix(t, k8shelper, minimalMatrixK8sVersion)
+	settings.KubernetesVersion = k8shelper.GetK8sServerVersion()
 
 	// Turn on DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)

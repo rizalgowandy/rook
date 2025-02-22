@@ -18,53 +18,65 @@ limitations under the License.
 package k8sutil
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
-	"path/filepath"
 
+	"github.com/pkg/errors"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	monitoringclient "github.com/prometheus-operator/prometheus-operator/pkg/client/versioned"
+	"github.com/rook/rook/pkg/clusterd"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sYAML "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-func getMonitoringClient() (*monitoringclient.Clientset, error) {
-	cfg, err := clientcmd.BuildConfigFromFlags("", "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to build config. %v", err)
-	}
-	client, err := monitoringclient.NewForConfig(cfg)
+func getMonitoringClient(context *clusterd.Context) (*monitoringclient.Clientset, error) {
+	client, err := monitoringclient.NewForConfig(context.KubeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get monitoring client. %v", err)
 	}
 	return client, nil
 }
 
-// GetServiceMonitor returns servicemonitor or an error
-func GetServiceMonitor(filePath string) (*monitoringv1.ServiceMonitor, error) {
-	file, err := ioutil.ReadFile(filepath.Clean(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("servicemonitor file could not be fetched. %v", err)
+// GetServiceMonitor creates serviceMonitor object template
+func GetServiceMonitor(name string, namespace string, portName string) *monitoringv1.ServiceMonitor {
+	return &monitoringv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"team": "rook",
+			},
+		},
+		Spec: monitoringv1.ServiceMonitorSpec{
+			NamespaceSelector: monitoringv1.NamespaceSelector{
+				MatchNames: []string{
+					namespace,
+				},
+			},
+			Selector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":          name,
+					"rook_cluster": namespace,
+				},
+			},
+			Endpoints: []monitoringv1.Endpoint{
+				{
+					Port:        portName,
+					Path:        "/metrics",
+					Interval:    "10s",
+					HonorLabels: true,
+				},
+			},
+		},
 	}
-	var servicemonitor monitoringv1.ServiceMonitor
-	err = k8sYAML.NewYAMLOrJSONDecoder(bytes.NewBufferString(string(file)), 1000).Decode(&servicemonitor)
-	if err != nil {
-		return nil, fmt.Errorf("servicemonitor could not be decoded. %v", err)
-	}
-	return &servicemonitor, nil
 }
 
 // CreateOrUpdateServiceMonitor creates serviceMonitor object or an error
-func CreateOrUpdateServiceMonitor(serviceMonitorDefinition *monitoringv1.ServiceMonitor) (*monitoringv1.ServiceMonitor, error) {
-	ctx := context.TODO()
+func CreateOrUpdateServiceMonitor(context *clusterd.Context, ctx context.Context, serviceMonitorDefinition *monitoringv1.ServiceMonitor) (*monitoringv1.ServiceMonitor, error) {
 	name := serviceMonitorDefinition.GetName()
 	namespace := serviceMonitorDefinition.GetNamespace()
 	logger.Debugf("creating servicemonitor %s", name)
-	client, err := getMonitoringClient()
+	client, err := getMonitoringClient(context)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get monitoring client. %v", err)
 	}
@@ -80,6 +92,7 @@ func CreateOrUpdateServiceMonitor(serviceMonitorDefinition *monitoringv1.Service
 		return nil, fmt.Errorf("failed to retrieve servicemonitor. %v", err)
 	}
 	oldSm.Spec = serviceMonitorDefinition.Spec
+	oldSm.ObjectMeta.Labels = serviceMonitorDefinition.ObjectMeta.Labels
 	sm, err := client.MonitoringV1().ServiceMonitors(namespace).Update(ctx, oldSm, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to update servicemonitor. %v", err)
@@ -87,46 +100,24 @@ func CreateOrUpdateServiceMonitor(serviceMonitorDefinition *monitoringv1.Service
 	return sm, nil
 }
 
-// GetPrometheusRule returns provided prometheus rules or an error
-func GetPrometheusRule(ruleFilePath string) (*monitoringv1.PrometheusRule, error) {
-	ruleFile, err := ioutil.ReadFile(filepath.Clean(ruleFilePath))
+// DeleteServiceMonitor deletes a ServiceMonitor and returns the error if any
+func DeleteServiceMonitor(context *clusterd.Context, ctx context.Context, ns string, name string) error {
+	client, err := getMonitoringClient(context)
 	if err != nil {
-		return nil, fmt.Errorf("prometheusRules file could not be fetched. %v", err)
+		return fmt.Errorf("failed to get monitoring client. %v", err)
 	}
-	var rule monitoringv1.PrometheusRule
-	err = k8sYAML.NewYAMLOrJSONDecoder(bytes.NewBufferString(string(ruleFile)), 1000).Decode(&rule)
+	_, err = client.MonitoringV1().ServiceMonitors(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("prometheusRules could not be decoded. %v", err)
+		// Either the service monitor does not exist or there are no privileges to detect it
+		// so we ignore any errors
+		return nil
 	}
-	return &rule, nil
-}
-
-// CreateOrUpdatePrometheusRule creates a prometheusRule object or an error
-func CreateOrUpdatePrometheusRule(prometheusRule *monitoringv1.PrometheusRule) (*monitoringv1.PrometheusRule, error) {
-	ctx := context.TODO()
-	name := prometheusRule.GetName()
-	namespace := prometheusRule.GetNamespace()
-	logger.Debugf("creating prometheusRule %s", name)
-	client, err := getMonitoringClient()
+	err = client.MonitoringV1().ServiceMonitors(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get monitoring client. %v", err)
-	}
-	promRule, err := client.MonitoringV1().PrometheusRules(namespace).Create(ctx, prometheusRule, metav1.CreateOptions{})
-	if err != nil {
-		if !kerrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create prometheusRules. %v", err)
+		if kerrors.IsNotFound(err) {
+			return nil
 		}
-		// Get current PrometheusRule so the ResourceVersion can be set as needed
-		// for the object update operation
-		promRule, err := client.MonitoringV1().PrometheusRules(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get prometheusRule object. %v", err)
-		}
-		promRule.Spec = prometheusRule.Spec
-		_, err = client.MonitoringV1().PrometheusRules(namespace).Update(ctx, promRule, metav1.UpdateOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to update prometheusRule. %v", err)
-		}
+		return errors.Wrapf(err, "failed to delete service monitor %q", name)
 	}
-	return promRule, nil
+	return nil
 }

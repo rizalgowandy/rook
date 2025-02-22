@@ -29,6 +29,7 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -83,42 +84,44 @@ func TestStartSecureDashboard(t *testing.T) {
 	moduleRetries := 0
 	exitCodeResponse := 0
 	clientset := test.New(t, 3)
-	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
-			logger.Infof("command: %s %v", command, args)
-			exitCodeResponse = 0
-			if args[1] == "module" {
-				if args[2] == "enable" {
-					enables++
-				} else if args[2] == "disable" {
-					disables++
-				}
+	mockFN := func(command string, args ...string) (string, error) {
+		logger.Infof("command: %s %v", command, args)
+		exitCodeResponse = 0
+		if args[1] == "module" {
+			if args[2] == "enable" {
+				enables++
+			} else if args[2] == "disable" {
+				disables++
 			}
-			if args[0] == "dashboard" && args[1] == "create-self-signed-cert" {
-				if moduleRetries < 2 {
-					logger.Infof("simulating retry...")
-					exitCodeResponse = invalidArgErrorCode
-					moduleRetries++
-					return "", errors.New("test failure")
-				}
+		}
+		if args[0] == "dashboard" && args[1] == "create-self-signed-cert" {
+			if moduleRetries < 2 {
+				logger.Infof("simulating retry...")
+				exitCodeResponse = invalidArgErrorCode
+				moduleRetries++
+				return "", errors.New("test failure")
 			}
-			return "", nil
-		},
+		}
+		return "", nil
 	}
-	executor.MockExecuteCommandWithOutputFileTimeout = func(timeout time.Duration, command, outfileArg string, arg ...string) (string, error) {
-		return executor.MockExecuteCommandWithOutputFile(command, outfileArg, arg...)
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: mockFN,
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			return mockFN(command, arg...)
+		},
 	}
 
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Squid,
 		OwnerInfo:   ownerInfo,
+		Context:     ctx,
 	}
 	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
-			Dashboard:   cephv1.DashboardSpec{Port: dashboardPortHTTP, Enabled: true, SSL: true},
-			CephVersion: cephv1.CephVersionSpec{Image: "ceph/ceph:v15"},
+			Dashboard:   cephv1.DashboardSpec{Port: 443, Enabled: true, SSL: true},
+			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:v15"},
 		},
 	}
 	c.exitCode = func(err error) (int, bool) {
@@ -129,7 +132,7 @@ func TestStartSecureDashboard(t *testing.T) {
 	}
 
 	dashboardInitWaitTime = 0
-	err := c.configureDashboardService("a")
+	err := c.configureDashboardService()
 	assert.NoError(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -141,10 +144,12 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err := c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.Nil(t, err)
 	assert.NotNil(t, svc)
+	assert.Equal(t, 443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 
 	// disable the dashboard
 	c.spec.Dashboard.Enabled = false
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -154,32 +159,29 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.NotNil(t, err)
 	assert.True(t, kerrors.IsNotFound(err))
-	assert.Nil(t, svc)
-}
+	assert.Equal(t, svc, &v1.Service{})
 
-func TestFileBasedPasswordSupported(t *testing.T) {
-	// for Ceph version Nautilus 14.2.17
-	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 17}}
-	value := FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	// Set the port to something over 1024 and confirm the port and targetPort are the same
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 1025
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
 
-	// for Ceph version Octopus 15.2.10
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].TargetPort.IntVal))
 
-	// for Ceph version Pacific
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	// Fall back to the default port
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 0
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
 
-	// for Ceph version Quincy
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
-
-	// for other Ceph Versions
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 15}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.False(t, value)
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 }

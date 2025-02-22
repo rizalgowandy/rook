@@ -18,10 +18,10 @@ package object
 
 import (
 	"encoding/json"
-	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/ceph/go-ceph/rgw/admin"
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/util/exec"
 )
@@ -37,47 +37,39 @@ const (
 
 // An ObjectUser defines the details of an object store user.
 type ObjectUser struct {
-	UserID      string  `json:"userId"`
-	DisplayName *string `json:"displayName"`
-	Email       *string `json:"email"`
-	AccessKey   *string `json:"accessKey"`
-	SecretKey   *string `json:"secretKey"`
-	SystemUser  bool    `json:"systemuser"`
+	UserID       string              `json:"userId"`
+	DisplayName  *string             `json:"displayName"`
+	Email        *string             `json:"email"`
+	AccessKey    *string             `json:"accessKey"`
+	SecretKey    *string             `json:"secretKey"`
+	SystemUser   bool                `json:"systemuser"`
+	AdminOpsUser bool                `json:"adminopsuser"`
+	MaxBuckets   int                 `json:"max_buckets"`
+	UserQuota    admin.QuotaSpec     `json:"user_quota"`
+	Caps         []admin.UserCapSpec `json:"caps"`
 }
 
-// ListUsers lists the object pool users.
-func ListUsers(c *Context) ([]string, int, error) {
-	result, err := runAdminCommand(c, true, "user", "list")
-	if err != nil {
-		return nil, RGWErrorUnknown, errors.Wrap(err, "failed to list users")
-	}
-
-	var s []string
-	if err := json.Unmarshal([]byte(result), &s); err != nil {
-		return nil, RGWErrorParse, errors.Wrapf(err, "failed to read users info result=%s", result)
-	}
-
-	return s, RGWErrorNone, nil
-}
-
-type rgwUserInfo struct {
-	UserID      string `json:"user_id"`
-	DisplayName string `json:"display_name"`
-	Email       string `json:"email"`
-	Keys        []struct {
-		AccessKey string `json:"access_key"`
-		SecretKey string `json:"secret_key"`
-	}
-}
-
+// func decodeUser(data string) (*ObjectUser, int, error) {
 func decodeUser(data string) (*ObjectUser, int, error) {
-	var user rgwUserInfo
+	var user admin.User
 	err := json.Unmarshal([]byte(data), &user)
 	if err != nil {
 		return nil, RGWErrorParse, errors.Wrapf(err, "failed to unmarshal json. %s", data)
 	}
 
-	rookUser := ObjectUser{UserID: user.UserID, DisplayName: &user.DisplayName, Email: &user.Email}
+	rookUser := ObjectUser{UserID: user.ID, DisplayName: &user.DisplayName, Email: &user.Email}
+
+	if len(user.Caps) > 0 {
+		rookUser.Caps = user.Caps
+	}
+
+	if user.MaxBuckets != nil {
+		rookUser.MaxBuckets = *user.MaxBuckets
+	}
+
+	if user.UserQuota.Enabled != nil {
+		rookUser.UserQuota = user.UserQuota
+	}
 
 	if len(user.Keys) > 0 {
 		rookUser.AccessKey = &user.Keys[0].AccessKey
@@ -90,6 +82,8 @@ func decodeUser(data string) (*ObjectUser, int, error) {
 }
 
 // GetUser returns the user with the given ID.
+// The function is used **ONCE** only to provision so the RGW Admin Ops User
+// Subsequent interaction with the API will be done with the created user
 func GetUser(c *Context, id string) (*ObjectUser, int, error) {
 	logger.Debugf("getting s3 user %q", id)
 	// note: err is set for non-existent user but result output is also empty
@@ -108,7 +102,9 @@ func GetUser(c *Context, id string) (*ObjectUser, int, error) {
 }
 
 // CreateUser creates a new user with the information given.
-func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
+// The function is used **ONCE** only to provision so the RGW Admin Ops User
+// Subsequent interaction with the API will be done with the created user
+func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
 	logger.Debugf("creating s3 user %q", user.UserID)
 
 	if strings.TrimSpace(user.UserID) == "" {
@@ -134,8 +130,28 @@ func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
 		args = append(args, "--system")
 	}
 
+	if user.AdminOpsUser {
+		args = append(args, "--caps", rgwAdminOpsUserCaps)
+	}
+
+	if user.AccessKey != nil {
+		args = append(args, "--access-key", *user.AccessKey)
+	}
+
+	if user.SecretKey != nil {
+		args = append(args, "--secret", *user.SecretKey)
+	}
+
+	if force {
+		args = append(args, "--yes-i-really-mean-it")
+	}
+
 	result, err := runAdminCommand(c, true, args...)
 	if err != nil {
+		if code, err := exec.ExtractExitCode(err); err == nil && code == int(syscall.EEXIST) {
+			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
+		}
+
 		if strings.Contains(result, "could not create user: unable to create user, user: ") {
 			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
 		}
@@ -143,39 +159,36 @@ func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
 		if strings.Contains(result, "could not create user: unable to create user, email: ") && strings.Contains(result, " is the email address an existing user") {
 			return nil, RGWErrorBadData, errors.New("email already in use")
 		}
+
+		if strings.Contains(result, "global_init: unable to open config file from search list") {
+			return nil, RGWErrorUnknown, errors.New("skipping reconcile since operator is still initializing")
+		}
+
 		// We don't know what happened
-		return nil, RGWErrorUnknown, errors.Wrap(err, "failed to create s3 user")
+		return nil, RGWErrorUnknown, errors.Wrapf(err, "failed to create s3 user. %s", result)
 	}
 	return decodeUser(result)
 }
 
-// UpdateUser updates the user whose ID matches the user.
-func UpdateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
-	logger.Infof("updating s3 user %q", user.UserID)
-
-	args := []string{"user", "modify", "--uid", user.UserID}
-
-	if user.DisplayName != nil {
-		args = append(args, "--display-name", *user.DisplayName)
-	}
-	if user.Email != nil {
-		args = append(args, "--email", *user.Email)
+// CreateOrRecreateUserIfExists if the user doesn't exist, it is created, should it already exist it is deleted and re-created
+// It is called from the rgw dashboard setup logic.
+func CreateOrRecreateUserIfExists(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
+	objUser, errCode, err := CreateUser(c, user, force)
+	if err != nil || (errCode != ErrorCodeFileExists && errCode != RGWErrorNone) {
+		return nil, errCode, err
 	}
 
-	body, err := runAdminCommand(c, false, args...)
-	if err != nil {
-		return nil, RGWErrorUnknown, errors.Wrap(err, "failed to update s3 user")
+	if errCode == RGWErrorNone {
+		return objUser, errCode, err
+	} else if errCode == ErrorCodeFileExists {
+		// If the user already exists, delete and re-create it
+		_, err := DeleteUser(c, user.UserID)
+		if err != nil {
+			return nil, RGWErrorUnknown, err
+		}
 	}
 
-	if body == "could not modify user: unable to modify user, user not found" {
-		return nil, RGWErrorNotFound, errors.New("s3 user not found")
-	}
-	match, err := extractJSON(body)
-	if err != nil {
-		return nil, RGWErrorParse, errors.Wrap(err, "failed to get json")
-	}
-
-	return decodeUser(match)
+	return CreateUser(c, user, force)
 }
 
 func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {
@@ -191,6 +204,8 @@ func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {
 }
 
 // DeleteUser deletes the user with the given ID.
+// Even though we should be using the Admin Ops API, we keep this on purpose until the entire migration is completed
+// Used for the dashboard user
 func DeleteUser(c *Context, id string, opts ...string) (string, error) {
 	args := []string{"user", "rm", "--uid", id}
 	if opts != nil {
@@ -210,72 +225,4 @@ func DeleteUser(c *Context, id string, opts ...string) (string, error) {
 	}
 
 	return result, errors.Wrapf(err, "failed to delete s3 user uid=%q", id)
-}
-
-// SetQuotaUserBucketMax will set maximum bucket quota for a user
-func SetQuotaUserBucketMax(c *Context, id string, max int) (string, error) {
-	logger.Infof("Setting user %q max buckets to %d", id, max)
-	args := []string{"--quota-scope", "user", "--max-buckets", strconv.Itoa(max)}
-	result, err := setUserQuota(c, id, args)
-	if err != nil {
-		err = errors.Wrap(err, "failed setting bucket max")
-	}
-	return result, err
-}
-
-func setUserQuota(c *Context, id string, args []string) (string, error) {
-	args = append([]string{"quota", "set", "--uid", id}, args...)
-	result, err := runAdminCommand(c, false, args...)
-	if err != nil {
-		err = errors.Wrap(err, "failed to set max buckets for user")
-	}
-	return result, err
-}
-
-// LinkUser will link a user to a bucket
-func LinkUser(c *Context, id, bucket string) (string, int, error) {
-	logger.Infof("Linking (user: %s) (bucket: %s)", id, bucket)
-	args := []string{"bucket", "link", "--uid", id, "--bucket", bucket}
-	result, err := runAdminCommand(c, false, args...)
-	if err != nil {
-		return "", RGWErrorUnknown, err
-	}
-	if strings.Contains(result, "bucket entry point user mismatch") {
-		return "", RGWErrorNotFound, err
-	}
-	return result, RGWErrorNone, nil
-}
-
-// EnableUserQuota will allows to enable quota defined for a user
-func EnableUserQuota(c *Context, id string) (string, error) {
-	logger.Debug("Enabling user quota for %q", id)
-	args := []string{"quota", "enable", "--quota-scope", "user", "--uid", id}
-	result, err := runAdminCommand(c, false, args...)
-	if err != nil {
-		err = errors.Wrap(err, "failed to enable quota for the user")
-	}
-	return result, err
-
-}
-
-// SetQuotaUserObject allows to set maximum limit on objects for a user
-func SetQuotaUserObjectMax(c *Context, id string, maxobjects string) (string, error) {
-	logger.Debugf("Setting user %q max objects to %s", id, maxobjects)
-	args := []string{"--quota-scope", "user", "--max-objects", maxobjects}
-	result, err := setUserQuota(c, id, args)
-	if err != nil {
-		err = errors.Wrap(err, "failed setting object max")
-	}
-	return result, err
-}
-
-// SetQuotaUserMaxSize allows to set maximum size for a user
-func SetQuotaUserMaxSize(c *Context, id string, maxsize string) (string, error) {
-	logger.Debugf("Setting user %q max size to %s", id, maxsize)
-	args := []string{"--quota-scope", "user", "--max-size", maxsize}
-	result, err := setUserQuota(c, id, args)
-	if err != nil {
-		err = errors.Wrap(err, "failed setting max size")
-	}
-	return result, err
 }
